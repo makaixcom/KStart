@@ -1088,11 +1088,7 @@ fn icons() -> &'static [Option<RgbaSurface>; 4] {
     SURFACES.get_or_init(|| {
         ICONS.map(|(_, bytes, _)| {
             let image = image::load_from_memory(bytes).ok()?.to_rgba8();
-            Some(RgbaSurface {
-                width: image.width(),
-                height: image.height(),
-                pixels: image.pixels().map(|p| p.0).collect(),
-            })
+            Some(RgbaSurface::from_pixels(image.width(), image.height(), image.pixels().map(|p| p.0).collect()))
         })
     })
 }

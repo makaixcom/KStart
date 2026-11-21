@@ -37,10 +37,9 @@ pub struct TextDrawCmd {
     pub font_slot: Option<usize>,
 }
 
-/// 菜单覆盖的区域，以及菜单文字在绘制列表中的起点
+/// 按绘制顺序记录覆盖区域及其文字起点，保留被局部遮挡文字的原始布局。
 pub struct PopupTextClip {
-    pub rect: (i32, i32, i32, i32),
-    pub first_menu_command: usize,
+    pub layers: Vec<((i32, i32, i32, i32), usize)>,
 }
 
 /// 当前打开的自绘弹出菜单类型
@@ -285,10 +284,13 @@ pub fn get_popup_menu_rect(_win_w: i32, win_h: i32) -> (i32, i32, i32, i32) {
 }
 
 /// 右上角皮肤快捷菜单矩形 `(x, y, w, h)`
+pub const SKIN_MENU_SCROLLBAR_WIDTH: i32 = 12;
+
 pub fn get_skin_quick_menu_rect(win_w: i32, win_h: i32, skins_count: usize) -> (i32, i32, i32, i32) {
     let total_rows = skins_count + 2;
-    let (h, vis_rows) = clamp_menu_height(win_h, total_rows, 22, 10);
-    let w = if vis_rows < total_rows { 210 } else { 195 };
+    // 最多 15 个皮肤，底部两个功能项固定显示。
+    let (h, vis_rows) = clamp_menu_height(win_h, skins_count.min(15) + 2, 22, 10);
+    let w = if vis_rows < total_rows { 195 + SKIN_MENU_SCROLLBAR_WIDTH } else { 195 };
     let x = (win_w - w - 6).max(4);
     let y = 22;
     (x, y, w, h)
@@ -357,6 +359,20 @@ pub fn hit_test_popup(
 ) -> HitTarget {
     if x < 1 || y < 1 || x >= width - 1 || y >= height - 1 {
         return HitTarget::None;
+    }
+    if menu == ActivePopupMenu::SkinQuickMenu {
+        let skin_rows = popup_visible_rows(height).saturating_sub(2);
+        let footer_y = 1 + skin_rows as i32 * 24;
+        if y >= footer_y {
+            return HitTarget::SkinQuickMenuItem(skins_count + ((y - footer_y) / 24) as usize);
+        }
+        if skin_rows < skins_count && x >= width - SKIN_MENU_SCROLLBAR_WIDTH {
+            return if y < 15 { HitTarget::MenuScrollUp }
+                else if y >= footer_y - 14 { HitTarget::MenuScrollDown }
+                else { HitTarget::MenuScrollTrack(y - 15) };
+        }
+        let index = scroll.min(skins_count.saturating_sub(skin_rows)) + ((y - 1) / 24) as usize;
+        return if index < skins_count { HitTarget::SkinQuickMenuItem(index) } else { HitTarget::None };
     }
     let rows = popup_visible_rows(height);
     let count = popup_item_count(menu, skins_count);
@@ -460,6 +476,158 @@ pub fn compute_visible_shortcut_rects(
     }).collect()
 }
 
+#[cfg(test)]
+mod spacing_tests {
+    use super::*;
+
+    #[test]
+    fn skin_container_and_group_edges_survive_category_selection_and_resize() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let skin = root.join("skin/LiveMessenger(搜索版)");
+        let cfg = SkinConfig::load_from_ini(&skin.join("Setup.ini")).unwrap();
+        let assets = SkinAssets::load(&skin, &cfg).unwrap();
+        let builtin = BuiltinIcons::load(root);
+        let user = UserConfig::default();
+        let categories: Vec<_> = (0..2).map(|index| CategoryTab {
+            id: format!("cat_{index}"), name: String::new(), icon_name: String::new(),
+            encrypted: false, active_group_index: 0,
+            groups: (0..2).map(|group| crate::model::ShortcutGroup {
+                id: format!("col_{group}"), category_id: format!("cat_{index}"),
+                title: String::new(), encrypted: false, items: Vec::new(),
+            }).collect(),
+        }).collect();
+        let selection = HashSet::new();
+        let border = RgbColor::new(190, 214, 224).to_bgra_u32();
+        let white = RgbColor::new(255, 255, 255).to_bgra_u32();
+        for (width, height) in [(441, 842), (350, 600), (700, 1000)] {
+            for active in 0..2 {
+                let state = RenderState {
+                    win_w: width, win_h: height, skin_cfg: &cfg, skin_assets: &assets,
+                    builtin_icons: &builtin, user_cfg: &user, categories: &categories,
+                    active_category: active, hover_target: HitTarget::None,
+                    down_target: HitTarget::None, time_string: "", search_query: "",
+                    search_focused: false, list_background: None, shortcut_scroll: 0,
+                    volume_level: None, tooltip: None, popup_menu: ActivePopupMenu::None,
+                    menu_scroll: 0, skins: &[], active_skin_index: 0, selected_skin_index: 0,
+                    dragging_shortcut: None, marquee_rect: None, selected_shortcuts: &selection,
+                };
+                let mut canvas = Canvas::new(width, height);
+                render_main_frame(&state, &mut canvas);
+                let pixel = |x: i32, y: i32| canvas.buffer[(y * width + x) as usize];
+                // 参考皮肤的外框与栏目之间始终保留一列空白，不得叠加第二圈边线。
+                for y in 90..height - 64 {
+                    assert_eq!(pixel(39, y), white, "列表左侧留白 {active}/{width}/{y}");
+                    assert_eq!(pixel(width - 9, y), border, "皮肤右边框");
+                    if y < height - 65 {
+                        assert_eq!(pixel(width - 10, y), cfg.window_bg_color.to_bgra_u32(), "右侧留白 {width}/{y}");
+                    }
+                }
+                for group in 0..2 {
+                    let (x, y, _, _) = get_group_bar_rect(&cfg, width, height, 2, 0, group);
+                    for row in 1..20 {
+                        assert_eq!(pixel(x, y + row), border, "栏目左边框 {active}/{group}/{row}");
+                    }
+                }
+                assert_eq!(pixel(200, height - 64), white, "底部不能出现额外描边");
+                assert_eq!(pixel(200, height - 63), border, "保留皮肤底边框");
+            }
+        }
+    }
+
+    #[test]
+    fn shortcut_scrollbar_reaches_first_and_last_rows_while_dragging() {
+        let grid = ShortcutGrid { left: 0, top: 20, bottom: 420, count: 50, cols: 1,
+            rows: 7, column_width: 140, hit_width: 134, row_height: 57, max_scroll: 43 };
+        let (thumb_y, _, travel) = flat_scrollbar_metrics(400, 7, 50, 0);
+        let grab = grid.scrollbar_grab(thumb_y + 5, 0).unwrap();
+        assert_eq!(grid.scroll_during_drag(20 + thumb_y + 5, grab), 0);
+        assert_eq!(grid.scroll_during_drag(20 + thumb_y + 5 + travel, grab), 43);
+        assert_eq!(grid.scroll_during_drag(2000, grab), 43);
+        assert_eq!(grid.scroll_during_drag(-100, grab), 0);
+    }
+
+    #[test]
+    fn skin_menu_caps_visible_rows_and_scrolls_to_last_item() {
+        for count in [0, 5, 13, 15, 16, 40] {
+            let (_, _, width, height) = get_skin_quick_menu_rect(800, 1200, count);
+            let rows = popup_visible_rows(height);
+            assert_eq!(rows, count.min(15) + 2);
+            let skin_rows = rows - 2;
+            for scroll in [0, count.saturating_sub(skin_rows)] {
+                assert_eq!(hit_test_popup(ActivePopupMenu::SkinQuickMenu,
+                    (width - 5, 1 + skin_rows as i32 * 24 + 12), (width, height), scroll, count),
+                    HitTarget::SkinQuickMenuItem(count));
+                assert_eq!(hit_test_popup(ActivePopupMenu::SkinQuickMenu,
+                    (width - 5, 1 + (skin_rows as i32 + 1) * 24 + 12), (width, height), scroll, count),
+                    HitTarget::SkinQuickMenuItem(count + 1));
+            }
+            if count + 2 > rows {
+                assert_eq!(width, 195 + SKIN_MENU_SCROLLBAR_WIDTH);
+                assert_eq!(hit_test_popup(ActivePopupMenu::SkinQuickMenu,
+                    (width - 5, 5), (width, height), 0, count), HitTarget::MenuScrollUp);
+                let last_scroll = count - skin_rows;
+                assert_eq!(hit_test_popup(ActivePopupMenu::SkinQuickMenu,
+                    (40, 1 + (skin_rows as i32 - 1) * 24 + 12), (width, height), last_scroll, count),
+                    HitTarget::SkinQuickMenuItem(count - 1));
+                assert_eq!(hit_test_popup(ActivePopupMenu::SkinQuickMenu,
+                    (width - SKIN_MENU_SCROLLBAR_WIDTH - 2, 12), (width, height), 0, count), HitTarget::SkinQuickMenuItem(0));
+            } else {
+                assert_eq!(width, 195);
+            }
+        }
+        let (_, _, _, height) = get_skin_quick_menu_rect(800, 250, 40);
+        assert!(popup_visible_rows(height) < 15);
+    }
+
+    #[test]
+    fn tooltip_wrapping_preserves_paths_and_chinese_remarks() {
+        for text in [r"E:\soft\Everything\everything.exe", "我是备注，这是一段较长的中文说明。"] {
+            let lines = wrap_tooltip_line(text, 60);
+            assert_eq!(lines.concat(), text);
+            assert!(lines.iter().all(|line| estimate_text_px_width(line) <= 60));
+        }
+    }
+
+    #[test]
+    fn resizing_preserves_spacing_in_all_display_modes() {
+        let mut cfg = SkinConfig::load_from_ini(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/skin/01 默认（葱青）/Setup.ini"
+        ))).unwrap();
+        cfg.item_list_box.width = crate::skin_parser::CoordExpr::Right(0);
+        let cat = CategoryTab {
+            id: String::new(), name: String::new(), icon_name: String::new(),
+            encrypted: false, active_group_index: 0,
+            groups: vec![crate::model::ShortcutGroup {
+                id: String::new(), category_id: String::new(), title: String::new(),
+                encrypted: false, items: Vec::new(),
+            }],
+        };
+        for (mode, large, hidden, right) in [
+            (0, false, false, false), (1, false, true, false),
+            (2, true, false, false), (3, true, true, false), (4, true, false, true),
+        ] {
+            for custom in [false, true] {
+                let mut settings = AdvancedSettings::default();
+                settings.set(Setting::LargeIcons, large.to_string());
+                settings.set(Setting::HideTitle, hidden.to_string());
+                settings.set(Setting::TitleRight, right.to_string());
+                if custom { settings.spacing[mode] = 173; }
+                for horizontal in [false, true] {
+                    settings.set(Setting::Horizontal, horizontal.to_string());
+                    for width in [120, 350, 700, 350] {
+                        let grid = shortcut_grid(&cfg, width, 600, &cat, &settings).unwrap();
+                        assert_eq!(grid.column_width, settings.spacing[mode] as i32);
+                        assert_eq!(grid.hit_width, settings.spacing[mode] as i32 - 6);
+                        assert_eq!(grid.cols, if horizontal {
+                            ((width - 8) / settings.spacing[mode] as i32).max(1) as usize
+                        } else { 1 });
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub struct ShortcutGrid {
     left: i32,
     top: i32,
@@ -474,9 +642,24 @@ pub struct ShortcutGrid {
 }
 
 impl ShortcutGrid {
+    pub fn scrollbar_grab(&self, offset: i32, scroll: usize) -> Option<i32> {
+        let (thumb_y, thumb_h, _) = flat_scrollbar_metrics(self.bottom - self.top, self.rows,
+            self.count.div_ceil(self.cols), scroll);
+        (14..self.bottom - self.top - 14).contains(&offset).then_some(
+            if (thumb_y..thumb_y + thumb_h).contains(&offset) { offset - thumb_y } else { thumb_h / 2 })
+    }
+
+    pub fn scroll_during_drag(&self, y: i32, grab: i32) -> usize {
+        let (_, _, travel) = flat_scrollbar_metrics(self.bottom - self.top, self.rows,
+            self.count.div_ceil(self.cols), 0);
+        if travel == 0 { return 0; }
+        let offset = (y - self.top - 14 - grab).clamp(0, travel) as usize;
+        (offset * self.max_scroll + travel as usize / 2) / travel as usize
+    }
+
     pub fn position_for_offset(&self, offset: i32) -> usize {
-        offset.clamp(0, self.bottom - self.top) as usize * self.max_scroll
-            / (self.bottom - self.top).max(1) as usize
+        if offset < 14 { 0 } else if offset >= self.bottom - self.top - 14 { self.max_scroll }
+        else { self.scroll_during_drag(self.top + offset, 0) }
     }
 }
 
@@ -488,21 +671,22 @@ pub fn shortcut_grid(cfg: &SkinConfig, w: i32, h: i32, cat: &CategoryTab, settin
     let bottom = y + height - ((cat.groups.len() - group - 1) as i32) * 20;
     let icon = if settings.enabled(Setting::LargeIcons) { 32 } else { 16 };
     let row_height = icon + if icon == 32 && !settings.enabled(Setting::TitleRight) && !settings.enabled(Setting::HideTitle) { 25 } else { 9 };
-    let usable_width = (width - if settings.enabled(Setting::Scrollbar) { 17 } else { 8 }).max(1);
+    let usable_width = (width - 8).max(1);
     let mode = match (settings.enabled(Setting::LargeIcons), settings.enabled(Setting::HideTitle), settings.enabled(Setting::TitleRight)) {
         (false, false, _) => 0, (false, true, _) => 1, (true, true, _) => 3,
         (true, false, true) => 4, _ => 2,
     };
     let spacing = settings.spacing[mode].clamp(50, 500) as i32;
-    let legacy_width = mode == 0 && spacing == 140;
-    let cols = if !settings.enabled(Setting::Horizontal) { 1 }
-        else if legacy_width { 2 }
+    let mut cols = if !settings.enabled(Setting::Horizontal) { 1 }
         else { (usable_width / spacing).max(1) } as usize;
     let drawn_height = row_height - 7;
     let rows = if bottom - top < drawn_height { 0 } else { ((bottom - top - drawn_height) / row_height + 1) as usize };
-    let column_width = (usable_width / cols as i32).max(if legacy_width { 110 } else { 1 });
-    let hit_width = if legacy_width { (column_width - 6).clamp(icon + 4, 136) }
-        else { (column_width - 6).max(icon + 4) };
+    if count > rows * cols && settings.enabled(Setting::Horizontal) {
+        cols = ((usable_width - SKIN_MENU_SCROLLBAR_WIDTH).max(1) / spacing).max(1) as usize;
+    }
+    // 间距设置决定固定列宽，窗口缩放只改变列数，不摊分剩余宽度。
+    let column_width = spacing;
+    let hit_width = (column_width - 6).max(icon + 4);
     Some(ShortcutGrid {
         left, top, bottom, count, cols, rows, column_width, hit_width,
         row_height, max_scroll: count.div_ceil(cols).saturating_sub(rows),
@@ -596,7 +780,7 @@ pub fn hit_test_main(
                     return HitTarget::GroupBar(g);
                 }
             }
-            if settings.enabled(Setting::Scrollbar) && mx >= lx + lw - 9 {
+            if mx >= lx + lw - SKIN_MENU_SCROLLBAR_WIDTH - 1 {
                 if let Some(grid) = shortcut_grid(cfg, win_w, win_h, cat, settings) {
                     if grid.max_scroll > 0 && my >= grid.top && my < grid.bottom {
                         return HitTarget::ListScroll(my - grid.top);
@@ -791,12 +975,35 @@ pub fn hit_test_modal(
 }
 
 /// 估算 12px 宋体字符串渲染像素宽度（ASCII 占 6px，汉字/全角占 12px）
-fn estimate_text_px_width(s: &str) -> i32 {
+pub(crate) fn estimate_text_px_width(s: &str) -> i32 {
     let mut w = 0i32;
     for ch in s.chars() {
         w += if ch.is_ascii() { 6 } else { 12 };
     }
     w
+}
+
+/// 提示内容按字符折行，长路径和中文备注均保留完整内容。
+pub(crate) fn wrap_tooltip_line(line: &str, max_width: i32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut width = 0;
+    for ch in line.chars().filter(|ch| *ch != '\r') {
+        if ch == '\n' {
+            lines.push(std::mem::take(&mut current));
+            width = 0;
+            continue;
+        }
+        let advance = if ch.is_ascii() { 6 } else { 12 };
+        if width + advance > max_width && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            width = 0;
+        }
+        current.push(ch);
+        width += advance;
+    }
+    lines.push(current);
+    lines
 }
 
 /// 渲染主窗口当前帧到 `Canvas`，返回 GDI 文本指令
@@ -926,7 +1133,7 @@ pub fn render_main_frame(
     let settings = &state.user_cfg.advanced;
     let list_color = crate::advanced::color(settings.text(Setting::ListBackgroundColor))
         .unwrap_or(cfg.item_list_bg_color);
-    canvas.fill_rect_alpha(lx, ly, lw, lh, list_color, (settings.number(Setting::ListOpacity) * 255 / 100) as u8);
+    canvas.fill_rect(lx, ly, lw, lh, list_color);
     if let Some(background) = state.list_background {
         canvas.blit_stretch(background, lx, ly, lw, lh);
     }
@@ -938,11 +1145,7 @@ pub fn render_main_frame(
         }
     }
 
-    let list_border_color = RgbColor::new(0xBE, 0xD6, 0xE0);
-    canvas.draw_hline(lx - 1, lx + lw, ly - 1, list_border_color);
-    canvas.draw_hline(lx - 1, lx + lw, ly + lh, list_border_color);
-    canvas.draw_vline(lx - 1, ly - 1, ly + lh, list_border_color);
-    canvas.draw_vline(lx + lw, ly - 1, ly + lh, list_border_color);
+    // 容器边框由八切片皮肤提供，额外描边会覆盖留白并形成重复边线。
 
     if state.user_cfg.enable_list {
         if let Some(cat) = state.categories.get(state.active_category) {
@@ -985,13 +1188,15 @@ pub fn render_main_frame(
                 let rects = compute_visible_shortcut_rects(cfg, w, h, cat, settings, state.shortcut_scroll);
                 let icon_size = if settings.enabled(Setting::LargeIcons) { 32 } else { 16 };
                 let show_title = !settings.enabled(Setting::HideTitle);
-                for (orig_idx, icon_x, icon_y, hw, hit_height) in rects {
+                for (orig_idx, cell_x, icon_y, hw, _hit_height) in rects {
                     let Some(item) = group.items.get(orig_idx) else {
                         continue;
                     };
                     let below = icon_size == 32 && !settings.enabled(Setting::TitleRight);
-                    let text_x = if below { icon_x } else { icon_x + icon_size + 4 };
-                    let text_top = if below { icon_y + icon_size + 1 } else { icon_y + (icon_size - 14) / 2 };
+                    // 大图标上下布局共用单元格中心，命中区域仍保持整列宽度。
+                    let icon_x = if below { cell_x - 2 + (hw - icon_size) / 2 } else { cell_x };
+                    let text_x = if below { cell_x - 2 } else { icon_x + icon_size + 4 };
+                    let text_top = if below { icon_y + icon_size + 4 } else { icon_y + (icon_size - 14) / 2 };
                     let text_width = if below { hw } else { (hw - icon_size - 6).max(0) };
                     let is_selected = state.selected_shortcuts.contains(&orig_idx);
                     let is_hover = state.hover_target == HitTarget::ShortcutItem(orig_idx);
@@ -1007,41 +1212,38 @@ pub fn render_main_frame(
                             icon_x - 2,
                             icon_y - 2,
                             icon_size + 4,
-                            hit_height,
+                            icon_size + 4,
                             RgbColor::new(0xB2, 0xBA, 0xD0),
                         );
                         canvas.stroke_rect(
                             icon_x - 2,
                             icon_y - 2,
                             icon_size + 4,
-                            hit_height,
+                            icon_size + 4,
                             RgbColor::new(0x0A, 0x24, 0x6A),
                         );
                         if show_title {
-                            canvas.fill_rect(text_x - 1, text_top, (estimate_text_px_width(&item.name) + 4).min(text_width), 15,
+                            let highlight_width = (estimate_text_px_width(&item.name) + 4).min(text_width);
+                            canvas.fill_rect(if below { text_x + (text_width - highlight_width) / 2 } else { text_x - 1 }, text_top,
+                                highlight_width, 15,
                                 RgbColor::new(0x0A, 0x24, 0x6A));
                         }
                     } else if is_hover || is_being_dragged {
-                        canvas.fill_rect(
-                            icon_x - 2,
-                            icon_y - 2,
-                            hw,
-                            hit_height,
-                            cfg.menu_colors.item_hover_bg_color,
-                        );
                         canvas.stroke_rect(
                             icon_x - 2,
                             icon_y - 2,
-                            hw,
-                            hit_height,
+                            icon_size + 4,
+                            icon_size + 4,
                             cfg.menu_colors.item_border_color,
                         );
                     }
 
                     if let Some(custom_ico) = &item.custom_icon_16 {
-                        canvas.blit_stretch(custom_ico, icon_x, icon_y, icon_size, icon_size);
+                        let icon = custom_ico.resize_to(icon_size as u32, icon_size as u32);
+                        canvas.blit(&icon, icon_x, icon_y);
                     } else if let Some(ico) = builtin.app_icons.get(&item.icon_key) {
-                        canvas.blit_stretch(ico, icon_x, icon_y, icon_size, icon_size);
+                        let icon = ico.resize_to(icon_size as u32, icon_size as u32);
+                        canvas.blit(&icon, icon_x, icon_y);
                     }
 
                     if !show_title { continue; }
@@ -1057,20 +1259,19 @@ pub fn render_main_frame(
                             item.text_color
                         },
                         bold: false,
-                        align: TextAlign::Left,
+                        align: if below { TextAlign::Center } else { TextAlign::Left },
                         mnemonic: false,
                         multiline: false,
                         font_slot: Some(0),
                     });
                 }
-                if settings.enabled(Setting::Scrollbar) {
+                {
                     if let Some(grid) = shortcut_grid(cfg, w, h, cat, settings) {
                         if grid.max_scroll > 0 {
                             let height = grid.bottom - grid.top;
-                            let thumb = (height / 4).max(8).min(height);
-                            let offset = (height - thumb) * state.shortcut_scroll.min(grid.max_scroll) as i32 / grid.max_scroll as i32;
-                            canvas.fill_rect(lx + lw - 8, grid.top, 7, height, list_border_color);
-                            canvas.fill_rect(lx + lw - 7, grid.top + offset, 5, thumb, cfg.menu_colors.border_color);
+                            draw_flat_scrollbar(canvas, lx + lw - SKIN_MENU_SCROLLBAR_WIDTH - 1,
+                                grid.top, SKIN_MENU_SCROLLBAR_WIDTH, height, grid.rows,
+                                grid.count.div_ceil(grid.cols), state.shortcut_scroll);
                         }
                     }
                 }
@@ -1144,24 +1345,19 @@ pub fn render_main_frame(
         canvas.blit(assets.category_tab.get(tab_state), tx, ty);
 
         if i == state.active_category && cfg.category_tab_direction == TabDirection::Vertical {
+            // 只连接类别标签与列表之间的留白，不能擦入栏目标题的第一列。
             canvas.fill_rect(
                 tx + tw - 1,
                 ty + 1,
-                (lx - (tx + tw - 1) + 1).max(2),
+                (lx - (tx + tw - 1)).max(0),
                 th - 2,
-                cfg.item_list_bg_color,
+                list_color,
             );
-            canvas.draw_hline(tx + tw - 1, lx, ty, list_border_color);
-            canvas.draw_hline(tx + tw - 1, lx, ty + th - 1, list_border_color);
         }
 
         let ico_x = tx + cfg.category_tab_icon_offset_x;
         let ico_y = ty + cfg.category_tab_icon_offset_y;
-        let cat_ico = if cat.icon_name.contains("cube") {
-            &builtin.cat_cube
-        } else {
-            &builtin.cat_laptop
-        };
+        let cat_ico = builtin.category_icon(&cat.icon_name);
         canvas.blit(cat_ico, ico_x, ico_y);
         if let Some(label) = cfg.category_tab_text {
             texts.push(TextDrawCmd {
@@ -1221,22 +1417,42 @@ pub fn render_main_frame(
         }
     }
 
+    let mut text_clip_layers = Vec::new();
     if let Some((x, y, label)) = state.tooltip {
-        let width = (estimate_text_px_width(label) + 14).clamp(30, (w - 8).max(30));
+        let lines: Vec<&str> = label.split('\n').collect();
+        let width = (lines.iter().map(|line| estimate_text_px_width(line)).max().unwrap_or(0) + 24)
+            .clamp(60, (w - 8).max(60));
+        let mut tip_texts = Vec::new();
+        let mut offset = 8;
+        let mut separator = None;
+        for (index, line) in lines.iter().enumerate() {
+            if index == 2 && lines[2..].iter().any(|line| !line.is_empty()) {
+                separator = Some(offset + 3);
+                offset += 10;
+            }
+            if index >= 2 && line.is_empty() { continue; }
+            for wrapped in wrap_tooltip_line(line, width - 20) {
+                tip_texts.push((wrapped, offset, index == 0));
+                offset += 18;
+            }
+        }
+        let height = offset + 8;
         let x = (*x).clamp(4, (w - width - 4).max(4));
-        let y = (*y).clamp(4, (h - 24).max(4));
-        canvas.fill_rect(x, y, width, 20, cfg.menu_colors.bg_color);
-        canvas.stroke_rect(x, y, width, 20, cfg.menu_colors.border_color);
-        texts.retain(|command| !rects_intersect(command.x, command.y, command.x + command.w,
-            command.y + command.h, x, y, x + width, y + 20));
-        texts.push(TextDrawCmd {
-            text: label.clone(), x: x + 5, y, w: width - 10, h: 20,
-            color: RgbColor::new(0,0,0), bold: false, align: TextAlign::Left,
+        let y = (*y).clamp(4, (h - height - 4).max(4));
+        canvas.fill_rect(x, y, width, height, RgbColor::new(255, 255, 225));
+        canvas.stroke_rect(x, y, width, height, RgbColor::new(0, 0, 0));
+        if let Some(offset) = separator {
+            canvas.fill_rect(x + 10, y + offset, width - 20, 1, RgbColor::new(110, 110, 90));
+        }
+        text_clip_layers.push(((x, y, width, height), texts.len()));
+        texts.extend(tip_texts.into_iter().map(|(text, offset, bold)| TextDrawCmd {
+            text, x: x + 10, y: y + offset, w: width - 20, h: 18,
+            color: RgbColor::new(0,0,0), bold, align: TextAlign::Left,
             mnemonic: false, multiline: false, font_slot: None,
-        });
+        }));
     }
     // 离线截图保留菜单预览，运行时由独立窗口绘制。
-    let popup_clip = popup_rect(state.popup_menu, w, h, state.skins.len()).map(|rect| {
+    if let Some(rect) = popup_rect(state.popup_menu, w, h, state.skins.len()) {
         let first_menu_command = texts.len();
         let menu = PopupMenuFrame {
             menu: state.popup_menu, skin_cfg: cfg, skin_assets: assets, builtin,
@@ -1245,8 +1461,9 @@ pub fn render_main_frame(
             scroll: state.menu_scroll, hover: state.hover_target,
         };
         render_popup_menu(&menu, canvas, &mut texts, rect);
-        PopupTextClip { rect, first_menu_command }
-    });
+        text_clip_layers.push((rect, first_menu_command));
+    }
+    let popup_clip = (!text_clip_layers.is_empty()).then_some(PopupTextClip { layers: text_clip_layers });
     (texts, popup_clip)
 }
 
@@ -1287,9 +1504,19 @@ pub fn render_popup_menu(
                 frame.user_cfg.enable_list, frame.user_cfg.enable_hotkey, frame.user_cfg.startup_lock,
             ), HitTarget::PopupMenuItem
         ),
-        ActivePopupMenu::SkinQuickMenu => draw!(
-            skin_quick_menu_items(frame.skins, frame.active_skin_index), HitTarget::SkinQuickMenuItem
-        ),
+        ActivePopupMenu::SkinQuickMenu => {
+            let items = skin_quick_menu_items(frame.skins, frame.active_skin_index);
+            let count = frame.skins.len();
+            let skin_height = popup_visible_rows(height).saturating_sub(2) as i32 * 24;
+            if skin_height > 0 {
+                render_generic_popup_menu_with_bar(frame.skin_cfg, frame.skin_assets, frame.builtin,
+                    canvas, texts, x, y, width, skin_height + 2, frame.scroll, &items[..count],
+                    |index| hover == HitTarget::SkinQuickMenuItem(index), SKIN_MENU_SCROLLBAR_WIDTH);
+            }
+            render_generic_popup_menu(frame.skin_cfg, frame.skin_assets, frame.builtin,
+                canvas, texts, x, y + skin_height, width, 50, 0, &items[count..],
+                |index| hover == HitTarget::SkinQuickMenuItem(count + index));
+        },
         ActivePopupMenu::ContextMenu { .. } => draw!(build_context_menu_items(), HitTarget::ContextMenuItem),
         ActivePopupMenu::ItemMenu { .. } => draw!(build_item_menu_items(), HitTarget::ItemMenuItem),
         ActivePopupMenu::SearchMode => draw!(
@@ -1333,6 +1560,18 @@ pub(crate) fn render_generic_popup_menu<A: Copy>(
     items: &[PopupMenuItem<A>],
     is_row_hover: impl Fn(usize) -> bool,
 ) {
+    render_generic_popup_menu_with_bar(skin_cfg, assets, builtin, canvas, texts,
+        menu_x, menu_y, menu_w, menu_h, scroll_row, items, is_row_hover, 15);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_generic_popup_menu_with_bar<A: Copy>(
+    skin_cfg: &SkinConfig, assets: &SkinAssets, builtin: &BuiltinIcons,
+    canvas: &mut Canvas, texts: &mut Vec<TextDrawCmd>,
+    menu_x: i32, menu_y: i32, menu_w: i32, menu_h: i32,
+    scroll_row: usize, items: &[PopupMenuItem<A>],
+    is_row_hover: impl Fn(usize) -> bool, scrollbar_width: i32,
+) {
     let mc = &skin_cfg.menu_colors;
 
     let shadow_alphas = [95u8, 65, 38, 16];
@@ -1372,7 +1611,7 @@ pub(crate) fn render_generic_popup_menu<A: Copy>(
     let max_scroll = total_rows.saturating_sub(visible_rows);
     let start_row = scroll_row.min(max_scroll);
     let end_row = (start_row + visible_rows).min(total_rows);
-    let content_w = if has_sb { menu_w - 15 } else { menu_w };
+    let content_w = if has_sb { menu_w - scrollbar_width } else { menu_w };
 
     for (local_idx, idx) in (start_row..end_row).enumerate() {
         let item = &items[idx];
@@ -1464,10 +1703,15 @@ pub(crate) fn render_generic_popup_menu<A: Copy>(
 
     // 绘制右侧垂直滚动条
     if has_sb {
-        let sb_x = menu_x + menu_w - 15;
+        let sb_x = menu_x + menu_w - scrollbar_width;
         let sb_y = menu_y + 1;
-        let sb_w = 14;
+        let sb_w = scrollbar_width - 1;
         let sb_h = menu_h - 2;
+        if scrollbar_width == SKIN_MENU_SCROLLBAR_WIDTH {
+            draw_flat_scrollbar(canvas, sb_x, sb_y, scrollbar_width, sb_h,
+                visible_rows, total_rows, start_row);
+            return;
+        }
         canvas.fill_rect(sb_x, sb_y, sb_w, sb_h, RgbColor::new(0xF0, 0xF0, 0xF0));
         canvas.draw_vline(sb_x, sb_y, sb_y + sb_h - 1, mc.separator_color);
 
@@ -1482,10 +1726,11 @@ pub(crate) fn render_generic_popup_menu<A: Copy>(
             RgbColor::new(0xA0, 0xA0, 0xA0),
         );
         let arr_c = RgbColor::new(0x33, 0x33, 0x33);
-        canvas.draw_hline(sb_x + 7, sb_x + 7, sb_y + 5, arr_c);
-        canvas.draw_hline(sb_x + 6, sb_x + 8, sb_y + 6, arr_c);
-        canvas.draw_hline(sb_x + 5, sb_x + 9, sb_y + 7, arr_c);
-        canvas.draw_hline(sb_x + 4, sb_x + 10, sb_y + 8, arr_c);
+        let center = sb_x + scrollbar_width / 2;
+        let radius = ((sb_w - 2) / 2).min(3);
+        for row in 0..=radius {
+            canvas.draw_hline(center - row, center + row, sb_y + 5 + row, arr_c);
+        }
 
         // 下箭头按钮
         let dn_y = sb_y + sb_h - 14;
@@ -1498,10 +1743,9 @@ pub(crate) fn render_generic_popup_menu<A: Copy>(
             RgbColor::new(255, 255, 255),
             RgbColor::new(0xA0, 0xA0, 0xA0),
         );
-        canvas.draw_hline(sb_x + 4, sb_x + 10, dn_y + 5, arr_c);
-        canvas.draw_hline(sb_x + 5, sb_x + 9, dn_y + 6, arr_c);
-        canvas.draw_hline(sb_x + 6, sb_x + 8, dn_y + 7, arr_c);
-        canvas.draw_hline(sb_x + 7, sb_x + 7, dn_y + 8, arr_c);
+        for row in 0..=radius {
+            canvas.draw_hline(center - (radius - row), center + (radius - row), dn_y + 5 + row, arr_c);
+        }
 
         // 滑块
         let track_y = sb_y + 14;
@@ -1523,6 +1767,32 @@ pub(crate) fn render_generic_popup_menu<A: Copy>(
             RgbColor::new(0x88, 0x88, 0x88),
         );
     }
+}
+
+fn flat_scrollbar_metrics(height: i32, visible: usize, total: usize, scroll: usize) -> (i32, i32, i32) {
+    let track = (height - 28).max(1);
+    let thumb = ((track as usize * visible) / total.max(1))
+        .clamp(24.min(track as usize), track as usize) as i32;
+    let travel = track - thumb;
+    let max_scroll = total.saturating_sub(visible);
+    (14 + (travel as usize * scroll.min(max_scroll) / max_scroll.max(1)) as i32, thumb, travel)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_flat_scrollbar(canvas: &mut Canvas, x: i32, y: i32, width: i32, height: i32,
+    visible: usize, total: usize, scroll: usize) {
+    if height < 30 { return; }
+    canvas.fill_rect(x, y, width - 1, height, RgbColor::new(245, 245, 245));
+    let center = x + width / 2;
+    let arrow = RgbColor::new(110, 110, 110);
+    for row in 0..3 {
+        canvas.draw_hline(center - row, center + row, y + 5 + row, arrow);
+        canvas.draw_hline(center - row, center + row, y + height - 6 - row, arrow);
+    }
+    let (offset, thumb_h, _) = flat_scrollbar_metrics(height, visible, total, scroll);
+    let thumb = RgbColor::new(168, 168, 168);
+    canvas.fill_rect(x + 2, y + offset + 2, width - 5, (thumb_h - 4).max(1), thumb);
+    canvas.fill_rect(x + 3, y + offset + 1, width - 7, (thumb_h - 2).max(1), thumb);
 }
 
 /// 构建右上角皮肤快捷菜单的菜单项。
@@ -1996,11 +2266,7 @@ fn render_category_manager(
                 RgbColor::new(0xD1, 0xEA, 0xF2),
             );
         }
-        let ico = if cat.icon_name.contains("cube") {
-            &ctx.builtin_icons.cat_cube
-        } else {
-            &ctx.builtin_icons.cat_laptop
-        };
+        let ico = ctx.builtin_icons.category_icon(&cat.icon_name);
         canvas.blit(ico, list_x + 6, ry + 2);
 
         let display_name = if is_sel && renaming {
@@ -2041,11 +2307,7 @@ fn render_category_manager(
     });
 
     if let Some(sel_cat) = ctx.categories.get(selected_idx) {
-        let ico = if sel_cat.icon_name.contains("cube") {
-            &ctx.builtin_icons.cat_cube
-        } else {
-            &ctx.builtin_icons.cat_laptop
-        };
+        let ico = ctx.builtin_icons.category_icon(&sel_cat.icon_name);
         canvas.blit(ico, 72, bot_y + 3);
     }
 

@@ -116,6 +116,28 @@ pub struct AppDataStore {
     pub shortcuts: Vec<ShortcutRecord>,
 }
 
+#[cfg(test)]
+mod icon_cache_tests {
+    use super::*;
+    #[test]
+    fn source_path_and_internal_icon_cache_remain_independent() {
+        let mut store = AppDataStore::default_store();
+        let item = &mut store.shortcuts[0];
+        let id = item.id.clone();
+        item.icon_key = r"Z:\missing-source\application.exe".into();
+        let mut icons = HashMap::new();
+        let mut icon = RgbaSurface::new_empty(32, 32);
+        icon.pixels_mut()[0] = [10, 20, 30, 255];
+        icons.insert(id.clone(), icon);
+        let tree = store.build_runtime_tree(Path::new("."), &icons, &HashMap::new());
+        let loaded = tree.iter().flat_map(|cat| &cat.groups).flat_map(|group| &group.items)
+            .find(|item| item.id == id).unwrap();
+        assert_eq!(loaded.icon_key, r"Z:\missing-source\application.exe");
+        assert_eq!(loaded.custom_icon_16.as_ref().unwrap().pixels()[0], [10, 20, 30, 255]);
+    }
+
+}
+
 impl AppDataStore {
     /// 从 `user/data.json` 加载数据；若文件不存在或解析失败则构建默认数据并写入磁盘
     pub fn load(base_dir: &Path) -> Self {
@@ -184,7 +206,12 @@ impl AppDataStore {
                 let items = sc_list
                     .into_iter()
                     .map(|sc| {
-                        let custom_icon_16 = custom_icons.get(&sc.icon_key).cloned();
+                        let custom_icon_16 = custom_icons.get(&sc.icon_key)
+                            .or_else(|| custom_icons.get(&sc.id)).cloned().or_else(|| {
+                            // 兼容旧版把图标来源路径写入 icon_key 的记录。
+                            let path = crate::targets::resolve_path(base_dir, &sc.icon_key);
+                            path.is_file().then(|| crate::skin_assets::load_custom_icon_16(&path)).flatten()
+                        });
                         ShortcutItem {
                             target_kind: sc
                                 .target_kind
@@ -283,6 +310,10 @@ impl AppDataStore {
 
     /// 生成唯一的快捷方式 ID
     pub fn next_shortcut_id(&self) -> String {
+        format!("sc_{}", self.next_shortcut_number())
+    }
+
+    pub fn next_shortcut_number(&self) -> u32 {
         let mut max_n = 0u32;
         for sc in &self.shortcuts {
             if let Some(num_str) = sc.id.strip_prefix("sc_") {
@@ -291,7 +322,7 @@ impl AppDataStore {
                 }
             }
         }
-        format!("sc_{}", max_n + 1)
+        max_n + 1
     }
 
     /// 默认初始数据（包含“我的程序”与“编程开发”两大分类、4 个栏目、23 个快捷方式）

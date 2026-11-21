@@ -11,7 +11,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, ES_AUTOHSCROLL,
     IDCANCEL, IDOK, LBN_SELCHANGE, LBS_HASSTRINGS, LBS_NOTIFY, LBS_OWNERDRAWFIXED, LB_ADDSTRING,
     LB_GETCURSEL, LB_SETCURSEL, LB_SETITEMHEIGHT, SW_HIDE, SW_SHOW, WS_EX_CLIENTEDGE, WS_TABSTOP,
-    WS_VSCROLL,
+    WS_VSCROLL, SBM_GETPOS, SBM_SETPOS, SBM_SETRANGE, SB_LINELEFT, SB_LINERIGHT,
+    SB_PAGELEFT, SB_PAGERIGHT, SB_THUMBTRACK, SB_THUMBPOSITION, SB_LEFT, SB_RIGHT,
 };
 
 pub const WIDTH: i32 = 504;
@@ -29,6 +30,7 @@ pub const ID_FONT: i32 = 2009;
 pub const ID_SPACING: i32 = 2010;
 const ID_UPDATES: i32 = 2011;
 const ID_UPGRADE: i32 = 2012;
+const ID_OPACITY_VALUE: i32 = 2013;
 const ID_FIELD: i32 = 2100;
 const PAGE_STRIDE: i32 = 100;
 const LABEL_OFFSET: i32 = 40;
@@ -198,6 +200,7 @@ fn field_label(field: &advanced::Field) -> &str {
         Key::GroupColor => "栏目文字色",
         Key::DefaultColor => "默认文字色",
         Key::VolumeStep => "幅度（%）",
+        Key::ListOpacity => "列表明度：",
         Key::MemoryLimit => "工作集上限（MB，0 为默认）",
         _ => field.label,
     }
@@ -324,6 +327,12 @@ pub unsafe fn populate(
                         }
                         _ => {}
                     }
+                } else if field.key == Key::ListOpacity {
+                    let slider = create_ctrl(hwnd, font, "SCROLLBAR", "", 0,
+                        WS_TABSTOP, field_x, y + 3, field_width - 64, 18, id);
+                    SendMessageW(slider, SBM_SETRANGE, 10, 100);
+                    create_ctrl(hwnd, font, "STATIC", "", 0, 0,
+                        field_x + field_width - 60, y + 4, 60, 17, ID_OPACITY_VALUE);
                 } else {
                     let picker = has_picker(field.key);
                     create_ctrl(
@@ -426,6 +435,12 @@ unsafe fn load_page(hwnd: HWND, page: usize, settings: &AdvancedSettings) {
     for (index, field) in advanced::FIELDS[page].iter().enumerate() {
         let id = field_id(page, index);
         let ctrl = GetDlgItem(hwnd, id);
+        if field.key == Key::ListOpacity {
+            let value = settings.number(field.key);
+            SendMessageW(ctrl, SBM_SETPOS, value as usize, 1);
+            set_ctrl_text(hwnd, ID_OPACITY_VALUE, &opacity_status(value as isize));
+            continue;
+        }
         match field.kind {
             FieldKind::Check(_) => {
                 SendMessageW(
@@ -454,6 +469,7 @@ unsafe fn current_page(hwnd: HWND) -> usize {
 
 pub unsafe fn show_page(hwnd: HWND) {
     let selected = current_page(hwnd);
+    ShowWindow(GetDlgItem(hwnd, ID_OPACITY_VALUE), if selected == 3 { SW_SHOW } else { SW_HIDE });
     for (page, fields) in advanced::FIELDS.iter().enumerate() {
         let show = if selected == page { SW_SHOW } else { SW_HIDE };
         for (index, _) in fields.iter().enumerate() {
@@ -475,6 +491,11 @@ pub unsafe fn show_page(hwnd: HWND) {
     windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 1);
 }
 
+pub unsafe fn select_page(hwnd: HWND, page: usize) {
+    SendMessageW(GetDlgItem(hwnd, ID_PAGE), LB_SETCURSEL, page.min(advanced::PAGES.len() - 1), 0);
+    show_page(hwnd);
+}
+
 pub unsafe fn reset_page(hwnd: HWND) -> usize {
     let page = current_page(hwnd);
     load_page(hwnd, page, &AdvancedSettings::default());
@@ -494,6 +515,10 @@ pub unsafe fn read(
         for (index, field) in fields.iter().enumerate() {
             let id = field_id(page, index);
             let ctrl = GetDlgItem(hwnd, id);
+            if field.key == Key::ListOpacity {
+                draft.set(field.key, SendMessageW(ctrl, SBM_GETPOS, 0, 0).clamp(10, 100).to_string());
+                continue;
+            }
             let value = match field.kind {
                 FieldKind::Check(_) => (SendMessageW(ctrl, BM_GETCHECK, 0, 0) != 0)
                     .then_some("1")
@@ -548,4 +573,24 @@ pub unsafe fn read(
 
 pub fn is_page_change(id: i32, notification: u32) -> bool {
     id == ID_PAGE && notification == LBN_SELCHANGE
+}
+
+fn opacity_status(value: isize) -> String {
+    match value { 0 => "（透明）".into(), 100 => "（不透明）".into(), _ => format!("{}%", value) }
+}
+
+/// 箭头、轨道和拖动均同步更新草稿控件，确定后才提交设置。
+pub unsafe fn update_opacity_value(hwnd: HWND, slider: HWND, message: usize) {
+    let Some(index) = advanced::FIELDS[3].iter().position(|field| field.key == Key::ListOpacity) else { return; };
+    if slider != 0 && slider == GetDlgItem(hwnd, field_id(3, index)) {
+        let current = SendMessageW(slider, SBM_GETPOS, 0, 0);
+        let value = match (message & 0xffff) as i32 {
+            SB_LINELEFT => current - 1, SB_LINERIGHT => current + 1,
+            SB_PAGELEFT => current - 10, SB_PAGERIGHT => current + 10,
+            SB_THUMBTRACK | SB_THUMBPOSITION => ((message >> 16) & 0xffff) as isize,
+            SB_LEFT => 10, SB_RIGHT => 100, _ => current,
+        }.clamp(10, 100);
+        SendMessageW(slider, SBM_SETPOS, value as usize, 1);
+        set_ctrl_text(hwnd, ID_OPACITY_VALUE, &opacity_status(value));
+    }
 }

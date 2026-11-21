@@ -248,6 +248,26 @@ pub struct UserConfig {
     pub window_width: i32,
     /// 窗口高度
     pub window_height: i32,
+    pub window_position: Option<(i32, i32)>,
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+    #[test]
+    fn saved_position_round_trips_including_negative_monitor_coordinates() {
+        let root = std::env::temp_dir().join(format!("kstart-position-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = UserConfig::default();
+        assert!(config.window_position.is_none());
+        config.window_position = Some((-1800, 175));
+        let result = config.save_to(&root, &HotkeyConfig::default(), &Verification::default());
+        let loaded = UserConfig::load_from(&root);
+        let _ = fs::remove_file(root.join("config.ini"));
+        let _ = fs::remove_dir(&root);
+        result.unwrap();
+        assert_eq!(loaded.window_position, Some((-1800, 175)));
+    }
 }
 
 impl Default for UserConfig {
@@ -264,6 +284,7 @@ impl Default for UserConfig {
             advanced: crate::advanced::AdvancedSettings::default(),
             window_width: 390,
             window_height: 845,
+            window_position: None,
         }
     }
 }
@@ -317,6 +338,8 @@ impl UserConfig {
             if let Some(h) = map.get("WindowHeight").and_then(|s| s.parse::<i32>().ok()) {
                 cfg.window_height = h.clamp(400, 1600);
             }
+            cfg.window_position = map.get("WindowLeft").and_then(|v| v.parse::<i32>().ok())
+                .zip(map.get("WindowTop").and_then(|v| v.parse::<i32>().ok()));
         }
 
         cfg
@@ -370,6 +393,10 @@ impl UserConfig {
             self.window_height,
         );
 
+        if let Some((left, top)) = self.window_position {
+            write_ini_value(&mut content, "WindowLeft", &left.to_string());
+            write_ini_value(&mut content, "WindowTop", &top.to_string());
+        }
         self.advanced.write_ini(&mut content);
         content.push_str("\r\n[Hotkeys]\r\n");
         for (key, target) in &hotkeys.bindings {

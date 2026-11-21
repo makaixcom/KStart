@@ -7,9 +7,9 @@ use std::{mem, ptr, sync::OnceLock};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GetStockObject, InvalidateRect, LineTo, MoveToEx, SelectObject, SetBkMode,
+    FillRect, GetStockObject, InvalidateRect, LineTo, MoveToEx, SelectObject, SetBkMode, SetBkColor,
     SetTextColor, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, HOLLOW_BRUSH, PAINTSTRUCT, PS_SOLID,
+    DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, PAINTSTRUCT, PS_SOLID,
     TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED};
@@ -25,7 +25,7 @@ const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     u32::from_le_bytes([r, g, b, 0])
 }
 
-const PAGE: u32 = rgb(246, 248, 250);
+pub(crate) const PAGE: u32 = rgb(246, 248, 250);
 const NAV: u32 = rgb(255, 255, 255);
 const BORDER: u32 = rgb(201, 211, 220);
 const INK: u32 = rgb(36, 51, 62);
@@ -49,11 +49,7 @@ fn icons() -> &'static [Option<RgbaSurface>; 7] {
         ICONS.map(|bytes| {
             let image = image::load_from_memory(bytes).ok()?.to_rgba8();
             Some(
-                RgbaSurface {
-                    width: image.width(),
-                    height: image.height(),
-                    pixels: image.pixels().map(|p| p.0).collect(),
-                }
+                RgbaSurface::from_pixels(image.width(), image.height(), image.pixels().map(|p| p.0).collect())
                 .resize_to(16, 16),
             )
         })
@@ -270,7 +266,14 @@ pub unsafe fn draw_navigation(draw: &DRAWITEMSTRUCT, font: HFONT) {
 pub unsafe fn static_color(dc: HDC) -> HBRUSH {
     SetBkMode(dc, TRANSPARENT as i32);
     SetTextColor(dc, INK);
-    GetStockObject(HOLLOW_BRUSH) as HBRUSH
+    SetBkColor(dc, PAGE);
+    static BACKGROUND: OnceLock<isize> = OnceLock::new();
+    *BACKGROUND.get_or_init(|| CreateSolidBrush(PAGE)) as HBRUSH
+}
+
+pub unsafe fn erase_background(hwnd: HWND, dc: HDC) {
+    let mut bounds = rect(0, 0, 0, 0);
+    if GetClientRect(hwnd, &mut bounds) != 0 { fill(dc, bounds, PAGE); }
 }
 
 pub unsafe fn button(hwnd: HWND, checkbox: bool, primary: bool) {

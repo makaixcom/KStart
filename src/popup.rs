@@ -12,12 +12,13 @@ use std::{cell::Cell, mem, ptr};
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromRect,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RedrawWindow,
+    RDW_INVALIDATE, RDW_UPDATENOW, RDW_NOERASE,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetCapture, VK_ESCAPE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, IsIconic, IsWindowVisible, LoadCursorW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, LoadCursorW,
     RegisterClassW, SendMessageW, SetForegroundWindow, ShowWindow, CS_DROPSHADOW, IDC_ARROW,
     MA_NOACTIVATE, SW_SHOW, SW_SHOWNOACTIVATE, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CLOSE,
     WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEACTIVATE,
@@ -258,14 +259,29 @@ pub struct PopupWindow {
     hwnd: HWND,
     menu: ActivePopupMenu,
     size: (i32, i32),
+    scroll_drag_offset: Option<i32>,
+    from_tray: bool,
 }
 
 impl PopupWindow {
+    fn scroll_geometry(self, skins_count: usize) -> Option<(i32, i32, usize)> {
+        let (visible, count) = self.scroll_bounds(skins_count);
+        let max_scroll = count.saturating_sub(visible);
+        if max_scroll == 0 { return None; }
+        let track = (visible as i32 * 24 - 28).max(18);
+        let minimum = if self.menu == ActivePopupMenu::SkinQuickMenu { 24 } else { 18 };
+        let thumb = ((track as usize * visible) / count.max(1))
+            .clamp(minimum.min(track as usize), track as usize) as i32;
+        Some((track - thumb, thumb, max_scroll))
+    }
     pub fn hit(self, position: (i32, i32), scroll: usize, skins_count: usize) -> HitTarget {
         hit_test_popup(self.menu, position, self.size, scroll, skins_count)
     }
 
     pub fn scroll_bounds(self, skins_count: usize) -> (usize, usize) {
+        if self.menu == ActivePopupMenu::SkinQuickMenu {
+            return (popup_visible_rows(self.size.1).saturating_sub(2), skins_count);
+        }
         (
             popup_visible_rows(self.size.1),
             popup_item_count(self.menu, skins_count),
@@ -318,11 +334,25 @@ fn position(menu: ActivePopupMenu, anchor: RECT, work: RECT, (w, h): (i32, i32))
 }
 
 pub unsafe fn sync(owner: HWND) {
+    sync_with_anchor(owner, None);
+}
+
+/// 托盘主菜单以屏幕坐标定位，不依赖主窗口是否可见。
+pub unsafe fn sync_from_tray(owner: HWND, point: POINT) {
+    sync_with_anchor(owner, Some(point));
+}
+
+fn skin_menu_initial_scroll(active: usize, count: usize, visible: usize) -> usize {
+    active.min(count.saturating_sub(1)).saturating_sub(visible / 2)
+        .min(count.saturating_sub(visible))
+}
+
+unsafe fn sync_with_anchor(owner: HWND, screen_anchor: Option<POINT>) {
     let Some((menu, previous)) = APP_STATE.with(|cell| {
         let mut guard = cell.try_borrow_mut().ok()?;
         let app = guard.as_mut()?;
         if let Some(window) = app.popup_window {
-            if window.menu == app.popup_menu {
+            if window.menu == app.popup_menu && screen_anchor.is_none() {
                 InvalidateRect(window.hwnd, ptr::null(), 0);
                 return None;
             }
@@ -344,7 +374,9 @@ pub unsafe fn sync(owner: HWND) {
         let app = guard.as_ref()?;
         let cfg = &app.skin_cfg;
         let (width, height) = (app.user_cfg.window_width, app.user_cfg.window_height);
-        let rect = match menu {
+        let rect = if let Some(point) = screen_anchor {
+            (point.x, point.y, 0, 0)
+        } else { match menu {
             ActivePopupMenu::SearchMode => cfg.search_btn_layout.resolve_rect(width, height),
             ActivePopupMenu::SkinQuickMenu => cfg.title_btn_skin.resolve_rect(width, height),
             ActivePopupMenu::MainMenu => {
@@ -364,14 +396,14 @@ pub unsafe fn sync(owner: HWND) {
             | ActivePopupMenu::ItemMenu { x, y, .. }
             | ActivePopupMenu::TrayStart { x, y, .. } => (x, y, 0, 0),
             ActivePopupMenu::None => return None,
-        };
+        }};
         Some((rect, app.skins.len(), width))
     }) else {
         dismiss(owner);
         return;
     };
     let mut origin = POINT { x, y };
-    if !matches!(menu, ActivePopupMenu::TrayStart { .. }) && ClientToScreen(owner, &mut origin) == 0
+    if screen_anchor.is_none() && !matches!(menu, ActivePopupMenu::TrayStart { .. }) && ClientToScreen(owner, &mut origin) == 0
     {
         dismiss(owner);
         return;
@@ -403,8 +435,8 @@ pub unsafe fn sync(owner: HWND) {
     };
     let (left, top) = position(menu, anchor, work, size);
     let class = to_wide(CLASS_NAME);
-    let tray_only = matches!(menu, ActivePopupMenu::TrayStart { .. })
-        && (IsIconic(owner) != 0 || IsWindowVisible(owner) == 0);
+    let from_tray = screen_anchor.is_some() || matches!(menu, ActivePopupMenu::TrayStart { .. });
+    let tray_only = from_tray;
     let hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW
             | if tray_only {
@@ -438,7 +470,11 @@ pub unsafe fn sync(owner: HWND) {
         if app.popup_menu != menu || app.popup_window.is_some() {
             return false;
         }
-        app.popup_window = Some(PopupWindow { hwnd, menu, size });
+        if menu == ActivePopupMenu::SkinQuickMenu {
+            let visible = popup_visible_rows(size.1).saturating_sub(2);
+            app.menu_scroll = skin_menu_initial_scroll(app.active_skin_index, app.skins.len(), visible);
+        }
+        app.popup_window = Some(PopupWindow { hwnd, menu, size, scroll_drag_offset: None, from_tray });
         true
     });
     if registered {
@@ -479,6 +515,17 @@ pub unsafe fn dismiss_visible(owner: HWND) {
     }
 }
 
+pub fn is_popup_window(hwnd: HWND) -> bool {
+    APP_STATE.with(|cell| cell.try_borrow().ok().is_some_and(|guard|
+        guard.as_ref().is_some_and(|app| app.popup_window.is_some_and(|window| window.hwnd == hwnd))))
+}
+
+pub unsafe fn dismiss_with_owner(owner: HWND) {
+    let follows_owner = APP_STATE.with(|cell| cell.try_borrow().ok().is_some_and(|guard|
+        guard.as_ref().is_some_and(|app| app.popup_window.is_some_and(|window| !window.from_tray))));
+    if follows_owner { dismiss(owner); }
+}
+
 /// 菜单不抢键盘焦点，滚轮消息可能由主窗口或菜单窗口收到。
 pub unsafe fn scroll(delta: i16) {
     let hwnd = APP_STATE.with(|cell| {
@@ -508,6 +555,37 @@ fn mouse_point(lparam: LPARAM) -> (i32, i32) {
     (lparam as i16 as i32, (lparam >> 16) as i16 as i32)
 }
 
+fn scroll_for_drag(y: i32, grab: i32, travel: i32, max_scroll: usize) -> usize {
+    if travel <= 0 { return 0; }
+    let offset = (y - 15 - grab).clamp(0, travel) as usize;
+    (offset * max_scroll + travel as usize / 2) / travel as usize
+}
+
+/// 捕获期间持续更新滚动位置，释放状态借用后再同步绘制，避免消息重入。
+unsafe fn drag_scroll(hwnd: HWND, point: (i32, i32), begin: bool, end: bool) -> bool {
+    let handled = APP_STATE.with(|cell| {
+        let mut guard = cell.try_borrow_mut().ok()?;
+        let app = guard.as_mut()?;
+        let window = app.popup_window.filter(|window| window.hwnd == hwnd)?;
+        let (travel, thumb, max_scroll) = window.scroll_geometry(app.skins.len())?;
+        let grab = if begin {
+            if !matches!(window.hit(point, app.menu_scroll, app.skins.len()), HitTarget::MenuScrollTrack(_)) {
+                return None;
+            }
+            let thumb_y = 15 + (travel as usize * app.menu_scroll.min(max_scroll) / max_scroll) as i32;
+            if (thumb_y..thumb_y + thumb).contains(&point.1) { point.1 - thumb_y } else { thumb / 2 }
+        } else { window.scroll_drag_offset? };
+        app.menu_scroll = scroll_for_drag(point.1, grab, travel, max_scroll);
+        app.hover_target = HitTarget::MenuScrollTrack(point.1 - 15);
+        app.popup_window.as_mut()?.scroll_drag_offset = if end { None } else { Some(grab) };
+        Some(())
+    }).is_some();
+    if handled {
+        RedrawWindow(hwnd, ptr::null(), 0, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    }
+    handled
+}
+
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     message: u32,
@@ -534,6 +612,12 @@ unsafe extern "system" fn wnd_proc(
         })
     };
     match message {
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_ACTIVATE if wparam & 0xffff == 0 => {
+            if let Some((window, owner, _, _)) = snapshot() {
+                if window.from_tray { dismiss(owner); }
+            }
+            0
+        }
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_ERASEBKGND => 1,
         WM_KEYDOWN if wparam as u16 == VK_ESCAPE => {
@@ -549,6 +633,7 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_LBUTTONDOWN => {
+            if drag_scroll(hwnd, mouse_point(lparam), true, false) { return 0; }
             if let Some((window, owner, _, _)) = snapshot() {
                 let (x, y) = mouse_point(lparam);
                 if x < 0 || y < 0 || x >= window.size.0 || y >= window.size.1 {
@@ -558,6 +643,7 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_LBUTTONUP => {
+            if drag_scroll(hwnd, mouse_point(lparam), false, true) { return 0; }
             if let Some((window, owner, scroll, skins)) = snapshot() {
                 if window.hit(mouse_point(lparam), scroll, skins) != HitTarget::None {
                     SendMessageW(owner, WM_SELECT, 0, lparam);
@@ -570,6 +656,7 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_MOUSEMOVE => {
+            if drag_scroll(hwnd, mouse_point(lparam), false, false) { return 0; }
             if let Some((window, _, scroll, skins)) = snapshot() {
                 APP_STATE.with(|cell| {
                     if let Ok(mut guard) = cell.try_borrow_mut() {
@@ -632,6 +719,45 @@ unsafe extern "system" fn wnd_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dragging_updates_scroll_without_releasing_and_clamps_at_edges() {
+        let window = PopupWindow { hwnd: 0, menu: ActivePopupMenu::SkinQuickMenu,
+            size: (207, 410), scroll_drag_offset: None, from_tray: false };
+        let (travel, thumb, max_scroll) = window.scroll_geometry(50).unwrap();
+        assert_eq!(max_scroll, 35);
+        let grab = thumb / 2;
+        let top = scroll_for_drag(15 + grab, grab, travel, max_scroll);
+        let middle = scroll_for_drag(15 + grab + travel / 2, grab, travel, max_scroll);
+        let bottom = scroll_for_drag(15 + grab + travel, grab, travel, max_scroll);
+        assert_eq!(top, 0);
+        assert!(middle > top && middle < bottom);
+        assert_eq!(bottom, max_scroll);
+        assert_eq!(scroll_for_drag(-500, grab, travel, max_scroll), 0);
+        assert_eq!(scroll_for_drag(2000, grab, travel, max_scroll), max_scroll);
+    }
+
+    #[test]
+    fn skin_menu_opens_with_active_skin_visible() {
+        for count in [0, 5, 15, 16, 50] {
+            let visible = count.min(15);
+            for active in 0..count.max(1) {
+                let first = skin_menu_initial_scroll(active, count, visible);
+                assert!(first <= count.saturating_sub(visible));
+                if count > 0 { assert!((first..first + visible).contains(&active)); }
+            }
+        }
+        assert_eq!(skin_menu_initial_scroll(25, 50, 15), 18);
+    }
+
+    #[test]
+    fn tray_main_menu_stays_above_taskbar_and_inside_work_area() {
+        let work = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+        let anchor = RECT { left: 1880, top: 1060, right: 1881, bottom: 1061 };
+        let (x, y) = position(ActivePopupMenu::MainMenu, anchor, work, (180, 400));
+        assert!(x >= work.left && x + 180 <= work.right);
+        assert!(y >= work.top && y + 400 <= work.bottom);
+    }
 
     #[test]
     fn search_menu_prefers_right_and_flips_at_screen_edge() {

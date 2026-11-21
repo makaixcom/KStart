@@ -2,6 +2,7 @@
 
 use crate::{skin_assets::RgbaSurface, to_wide};
 use std::{
+    collections::HashSet,
     ffi::c_void,
     fs,
     hash::{DefaultHasher, Hash, Hasher},
@@ -9,7 +10,7 @@ use std::{
     mem,
     path::PathBuf,
     ptr,
-    sync::{Mutex, OnceLock},
+    sync::{mpsc, Arc, Mutex, OnceLock},
 };
 use windows_sys::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
@@ -23,6 +24,93 @@ use windows_sys::Win32::Networking::WinHttp::{
 const LIMIT: usize = 128 * 1024;
 type ResultImage = (String, RgbaSurface);
 static RESULTS: OnceLock<Mutex<Vec<ResultImage>>> = OnceLock::new();
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Request {
+    root: PathBuf,
+    url: String,
+    cache: bool,
+}
+
+struct WorkerPool {
+    sender: mpsc::Sender<Request>,
+    pending: Arc<Mutex<HashSet<Request>>>,
+}
+
+impl WorkerPool {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel::<Request>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        let pending = Arc::new(Mutex::new(HashSet::new()));
+        for _ in 0..2 {
+            let receiver = Arc::clone(&receiver);
+            let pending = Arc::clone(&pending);
+            std::thread::spawn(move || loop {
+                let request = match receiver.lock() {
+                    Ok(queue) => match queue.recv() {
+                        Ok(request) => request,
+                        Err(_) => break,
+                    },
+                    Err(_) => break,
+                };
+                if let Some(icon) = fetch(&request.root, &request.url, request.cache) {
+                    if let Ok(mut results) = RESULTS.get_or_init(|| Mutex::new(Vec::new())).lock() {
+                        results.push((request.url.clone(), icon));
+                    }
+                }
+                if let Ok(mut pending) = pending.lock() {
+                    pending.remove(&request);
+                }
+            });
+        }
+        Self { sender, pending }
+    }
+
+    fn enqueue(&self, request: Request) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        if !pending.insert(request.clone()) {
+            return;
+        }
+        drop(pending);
+        if let Err(error) = self.sender.send(request) {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&error.0);
+            }
+        }
+    }
+}
+
+static WORKERS: OnceLock<WorkerPool> = OnceLock::new();
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_requests_are_coalesced_and_failed_requests_can_retry() {
+        let (sender, receiver) = mpsc::channel();
+        let pool = WorkerPool {
+            sender,
+            pending: Arc::new(Mutex::new(HashSet::new())),
+        };
+        let request = Request {
+            root: "first".into(),
+            url: "https://example.invalid/a".into(),
+            cache: true,
+        };
+        pool.enqueue(request.clone());
+        pool.enqueue(request.clone());
+        let mut other = request.clone();
+        other.root = "second".into();
+        pool.enqueue(other);
+        assert_eq!(receiver.try_iter().count(), 2);
+        pool.pending.lock().unwrap().remove(&request);
+        pool.enqueue(request);
+        assert_eq!(receiver.try_iter().count(), 1);
+    }
+}
 
 struct Handle(*mut c_void);
 
@@ -50,13 +138,9 @@ pub fn fetch_for_shortcut(root: PathBuf, url: String, cache: bool) {
     if !is_web_url(&url) {
         return;
     }
-    std::thread::spawn(move || {
-        if let Some(icon) = fetch(&root, &url, cache) {
-            if let Ok(mut results) = RESULTS.get_or_init(|| Mutex::new(Vec::new())).lock() {
-                results.push((url, icon));
-            }
-        }
-    });
+    WORKERS
+        .get_or_init(WorkerPool::new)
+        .enqueue(Request { root, url, cache });
 }
 
 pub fn take_results() -> Vec<ResultImage> {
@@ -116,7 +200,7 @@ fn fetch(root: &std::path::Path, url: &str, cache: bool) -> Option<RgbaSurface> 
         .resize_exact(16, 16, image::imageops::FilterType::Triangle)
         .to_rgba8();
     let mut icon = RgbaSurface::new_empty(16, 16);
-    for (dst, src) in icon.pixels.iter_mut().zip(image.pixels()) {
+    for (dst, src) in icon.pixels_mut().iter_mut().zip(image.pixels()) {
         *dst = src.0;
     }
     if cache && fs::create_dir_all(dir).is_ok() {

@@ -139,7 +139,7 @@ pub const FIELDS: [&[Field]; 6] = [
         field!(
             TrayVisibility,
             "显示托盘图标",
-            FieldKind::Choice(&["显示", "不显示", "仅最小化时"], 1)
+            FieldKind::Choice(&["显示", "不显示", "仅最小化时"], 0)
         ),
         check!(CloseMinimizes, "点击关闭按钮仅最小化"),
         check!(TrayClickShowsList, "单击托盘图标激活列表"),
@@ -236,7 +236,7 @@ pub const FIELDS: [&[Field]; 6] = [
         field!(
             Tooltips,
             "提示条",
-            FieldKind::Choice(&["简单提示条", "详细提示条", "不显示"], 2)
+            FieldKind::Choice(&["简单提示条", "标准提示条", "不显示"], 2)
         ),
         check!(Scrollbar, "滚动条模式"),
         check!(HideSearchButton, "隐藏搜索按钮"),
@@ -244,7 +244,7 @@ pub const FIELDS: [&[Field]; 6] = [
         field!(
             ListOpacity,
             "列表不透明度（%）",
-            FieldKind::Number(0, 100, 100)
+            FieldKind::Number(10, 100, 100)
         ),
         field!(ListBackground, "列表背景图片", FieldKind::Text("")),
         field!(
@@ -436,6 +436,10 @@ impl AdvancedSettings {
             .unwrap_or_else(|| matches!(Self::field(key).kind, FieldKind::Check(true)))
     }
 
+    pub fn launch_on_click(&self, double_click: bool) -> bool {
+        self.enabled(Key::DoubleClick) == double_click
+    }
+
     pub fn number(&self, key: Key) -> u32 {
         let (min, max, default) = match Self::field(key).kind {
             FieldKind::Choice(labels, index) => (0, (labels.len() - 1) as u32, index as u32),
@@ -474,7 +478,7 @@ pub fn color(text: &str) -> Option<crate::skin_parser::RgbColor> {
     ))
 }
 
-pub fn format_time(pattern: &str, now: chrono::DateTime<chrono::Local>, weekday: &str) -> String {
+pub fn format_time(pattern: &str, now: chrono::DateTime<chrono::FixedOffset>, weekday: &str) -> String {
     use chrono::Datelike;
     let pattern = if pattern.is_empty() {
         "m月d日 week time"
@@ -524,8 +528,16 @@ mod tests {
         let empty: AdvancedSettings = serde_json::from_str("{}").unwrap();
         assert!(!empty.enabled(Key::AutoStart));
         assert!(empty.enabled(Key::Horizontal));
+        assert_eq!(empty.number(Key::TrayVisibility), 0);
+        let mut clicks = AdvancedSettings::default();
+        clicks.set(Key::DoubleClick, "1".into());
+        assert!(!clicks.launch_on_click(false));
+        assert!(clicks.launch_on_click(true));
+        clicks.set(Key::DoubleClick, "0".into());
+        assert!(clicks.launch_on_click(false));
+        assert!(!clicks.launch_on_click(true));
         assert_eq!(empty.number(Key::HoverDelay), 500);
-        let now = chrono::Local
+        let now = chrono::FixedOffset::east_opt(8 * 3600).unwrap()
             .with_ymd_and_hms(2026, 11, 21, 9, 8, 0)
             .single()
             .unwrap();

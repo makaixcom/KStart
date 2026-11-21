@@ -10,7 +10,7 @@ use std::{
     fs,
     hash::{DefaultHasher, Hash, Hasher},
     io, mem,
-    path::Path,
+    path::{Path, PathBuf},
     ptr,
 };
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HWND};
@@ -53,10 +53,12 @@ pub unsafe fn populate(hwnd: HWND, font: HFONT) -> bool {
             app.skins.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
             app.active_skin_index,
             categories(app),
+            app.advanced_window.advanced_page,
         ))
     });
-    if let Some((draft, skins, skin, cats)) = init {
+    if let Some((draft, skins, skin, cats, page)) = init {
         dialog::populate(hwnd, font, &draft, &skins, skin, &cats);
+        dialog::select_page(hwnd, page);
         true
     } else {
         false
@@ -161,7 +163,7 @@ pub unsafe fn command(hwnd: HWND, id: i32, notification: u32) -> bool {
             if let Some(dir) = pick_folder_dialog(hwnd, "选择备份目录") {
                 let folder = dir.join(format!(
                     "KStart-{}",
-                    chrono::Local::now().format("%Y%m%d-%H%M%S")
+                    crate::local_clock::now().format("%Y%m%d-%H%M%S")
                 ));
                 match backup(&base, &folder) {
                     Ok(()) => message(hwnd, &format!("备份已保存到 {}", folder.display())),
@@ -384,6 +386,7 @@ unsafe fn apply(
     }
     crate::advanced_window::update_tray(owner);
     crate::advanced_window::stretch_docked(owner);
+    crate::advanced_window::apply_opacity(owner);
     InvalidateRect(owner, ptr::null(), 0);
     Ok(())
 }
@@ -433,7 +436,7 @@ pub fn backup(base: &Path, target: &Path) -> io::Result<()> {
     let nonce = format!(
         "{}-{}",
         std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
     );
     let staging = parent.join(format!(".kstart-backup-{nonce}"));
     let previous = parent.join(format!(".kstart-previous-{nonce}"));
@@ -480,7 +483,7 @@ fn restore(owner: HWND, base: &Path, source: &Path) -> io::Result<()> {
     }
     let rollback = base.join("user/backups").join(format!(
         "restore-{}",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
+        crate::local_clock::now().format("%Y%m%d-%H%M%S")
     ));
     backup(base, &rollback)?;
     let user_dir = base.join("user");
@@ -512,6 +515,7 @@ fn restore(owner: HWND, base: &Path, source: &Path) -> io::Result<()> {
         apply_hrgn_safely(owner, region);
     }
     unsafe {
+        crate::advanced_window::apply_opacity(owner);
         InvalidateRect(owner, ptr::null(), 0);
     }
     Ok(())
@@ -558,6 +562,42 @@ pub struct DroppedFile {
     pub args: String,
     pub work_dir: String,
     pub icon: Option<crate::skin_assets::RgbaSurface>,
+    pub icon_source: String,
+}
+
+#[cfg(test)]
+mod drop_icon_tests {
+    use super::*;
+
+    #[test]
+    fn shortcut_default_icon_comes_from_its_target_program() {
+        let shortcut = Path::new(r"C:\Users\test\Desktop\软件.lnk");
+        let program = r"D:\Apps\软件\app.exe";
+        assert_eq!(default_drop_icon_source(shortcut, Some(program)), Path::new(program));
+        assert_eq!(default_drop_icon_source(shortcut, None), shortcut);
+    }
+
+    #[test]
+    fn relative_launch_path_keeps_the_original_icon_source() {
+        let file = std::env::current_exe().unwrap();
+        let base = file.parent().unwrap();
+        let mut settings = AdvancedSettings::default();
+        settings.set(Key::RelativePaths, "1".into());
+        settings.set(Key::SkipIconCache, "1".into());
+        settings.set(Key::SkipExeIcons, "1".into());
+        let dropped = prepare_drop(base, &settings, &file);
+        assert_eq!(dropped.icon_source, file.to_string_lossy());
+        assert!(dropped.target.starts_with(".\\"));
+        assert!(dropped.icon.is_none());
+    }
+}
+
+fn default_drop_icon_source(file: &Path, link_target: Option<&str>) -> PathBuf {
+    match link_target.filter(|target| !target.is_empty()) {
+        Some(target) if Path::new(target).is_absolute() => PathBuf::from(target),
+        Some(target) => file.parent().unwrap_or_else(|| Path::new(".")).join(target),
+        None => file.to_path_buf(),
+    }
 }
 
 pub fn relative_target(base: &Path, path: &Path) -> String {
@@ -581,8 +621,12 @@ pub fn prepare_drop(base: &Path, settings: &AdvancedSettings, file: &Path) -> Dr
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // 默认图标始终取链接目标；是否把启动路径展开为目标由设置另行决定。
+    let file_link = extension.eq_ignore_ascii_case("lnk")
+        .then(|| crate::advanced_shell::file_link(file)).flatten();
+    let icon_path = default_drop_icon_source(file, file_link.as_ref().map(|link| link.0.as_str()));
     if extension.eq_ignore_ascii_case("lnk") && settings.enabled(Key::ReadFileLink) {
-        if let Some(link) = crate::advanced_shell::file_link(file) {
+        if let Some(link) = file_link {
             (target, args, work_dir) = link;
         }
     } else if extension.eq_ignore_ascii_case("url") && settings.enabled(Key::ReadUrl) {
@@ -591,16 +635,12 @@ pub fn prepare_drop(base: &Path, settings: &AdvancedSettings, file: &Path) -> Dr
         }
     }
     let resolved_path = Path::new(&target);
-    let icon_path = if resolved_path.is_absolute() {
-        resolved_path
-    } else {
-        file
-    };
     let icon = if settings.enabled(Key::WebIcons) && crate::advanced_web_icon::is_web_url(&target) {
         None
     } else {
-        cached_file_icon(base, settings, icon_path)
+        cached_file_icon(base, settings, &icon_path)
     };
+    let icon_source = icon_path.to_string_lossy().into_owned();
     if settings.enabled(Key::RelativePaths) && resolved_path.is_absolute() {
         target = relative_target(base, resolved_path);
         if Path::new(&work_dir).is_absolute() {
@@ -613,6 +653,7 @@ pub fn prepare_drop(base: &Path, settings: &AdvancedSettings, file: &Path) -> Dr
         args,
         work_dir,
         icon,
+        icon_source,
     }
 }
 
@@ -629,7 +670,7 @@ fn cached_file_icon(
         return None;
     }
     if settings.enabled(Key::SkipIconCache) {
-        return crate::skin_assets::extract_file_icon_16(file);
+        return crate::skin_assets::extract_file_icon_32(file);
     }
     let mut hasher = DefaultHasher::new();
     file.hash(&mut hasher);
@@ -638,11 +679,11 @@ fn cached_file_icon(
         .and_then(|meta| meta.modified().ok())
         .hash(&mut hasher);
     let directory = base.join("user/icon-cache");
-    let cache = directory.join(format!("{:016x}.png", hasher.finish()));
+    let cache = directory.join(format!("{:016x}-32.png", hasher.finish()));
     if let Some(image) = crate::skin_assets::RgbaSurface::load_file(&cache) {
         return Some(image);
     }
-    let image = crate::skin_assets::extract_file_icon_16(file)?;
+    let image = crate::skin_assets::extract_file_icon_32(file)?;
     if fs::create_dir_all(directory).is_ok() {
         let _ = image.save_png(&cache);
     }

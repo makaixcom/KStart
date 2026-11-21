@@ -12,8 +12,8 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateSolidBrush, FillRect, GetSysColor, InvalidateRect, SetBkMode, SetDIBitsToDevice,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, COLOR_BTNFACE, DIB_RGB_COLORS, HBRUSH, HDC, HFONT,
+    CreateSolidBrush, FillRect, InvalidateRect, SetBkMode, SetDIBitsToDevice,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBRUSH, HDC, HFONT,
     TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -47,6 +47,8 @@ pub const ID_CAT_LIST: i32 = 1107;
 pub const ID_CAT_RENAME_EDIT: i32 = 1108;
 pub const ID_CAT_RENAME_OK: i32 = 1109;
 pub const ID_CAT_BTN_ICON: i32 = 1110;
+pub const ID_CAT_ADD_ICON: i32 = 1111;
+pub const ID_CAT_MANAGE_ICONS: i32 = 1112;
 
 pub const ID_COL_LIST: i32 = 1201;
 pub const ID_COL_BTN_UP: i32 = 1202;
@@ -63,6 +65,7 @@ pub const ID_EDIT_PATH: i32 = 1406;
 pub const ID_EDIT_LBL_ICON: i32 = 1407;
 pub const ID_EDIT_ICON: i32 = 1408;
 pub const ID_EDIT_PICK_ICON: i32 = 1409;
+pub const ID_EDIT_ICON_PREVIEW: i32 = 1499;
 pub const ID_EDIT_LBL_COLOR: i32 = 1410;
 pub const ID_EDIT_LBL_ARGS: i32 = 1411;
 pub const ID_EDIT_ARGS: i32 = 1412;
@@ -79,7 +82,7 @@ pub fn native_modal_client_info(modal: &ActiveModal) -> (i32, i32, &'static str)
     match modal {
         ActiveModal::Advanced(_) => (crate::advanced_dialog::WIDTH, crate::advanced_dialog::HEIGHT, "高级设置"),
         ActiveModal::SkinManager => (430, 390, "皮肤管理器"),
-        ActiveModal::CategoryManager { .. } => (380, 370, "类别管理"),
+        ActiveModal::CategoryManager { .. } => (410, 438, "类别管理"),
         ActiveModal::ColumnSort { .. } => (350, 320, "栏目排序"),
         ActiveModal::Search(_) => (crate::search_dialog::WIDTH, crate::search_dialog::HEIGHT, "搜索"),
         ActiveModal::EditShortcut(ed) => {
@@ -126,6 +129,13 @@ pub(crate) unsafe fn create_ctrl(
     );
     if ctrl != 0 && hfont != 0 {
         SendMessageW(ctrl, WM_SETFONT, hfont as usize, 1);
+    }
+    if cls.eq_ignore_ascii_case("BUTTON") {
+        let kind = style & 0xf;
+        if kind <= BS_AUTOCHECKBOX as u32 {
+            crate::advanced_style::button(ctrl, kind == BS_AUTOCHECKBOX as u32 || kind == 2,
+                id == IDOK);
+        }
     }
     ctrl
 }
@@ -232,114 +242,7 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
         }
 
         ActiveModal::CategoryManager { selected_idx, .. } => {
-            let btns = [
-                ("新建", ID_CAT_BTN_NEW),
-                ("删除", ID_CAT_BTN_DEL),
-                ("改名", ID_CAT_BTN_RENAME),
-                ("加密", ID_CAT_BTN_ENC),
-                ("上移", ID_CAT_BTN_UP),
-                ("下移", ID_CAT_BTN_DOWN),
-            ];
-            for (i, (label, id)) in btns.iter().enumerate() {
-                create_ctrl(
-                    hwnd,
-                    hfont,
-                    "BUTTON",
-                    label,
-                    0,
-                    WS_TABSTOP | (BS_PUSHBUTTON as u32),
-                    12 + (i as i32) * 60,
-                    12,
-                    56,
-                    26,
-                    *id,
-                );
-            }
-
-            let lb = create_ctrl(
-                hwnd,
-                hfont,
-                "LISTBOX",
-                "",
-                WS_EX_CLIENTEDGE,
-                WS_BORDER | WS_VSCROLL | WS_TABSTOP | (LBS_NOTIFY as u32) | (LBS_NOINTEGRALHEIGHT as u32),
-                12,
-                46,
-                356,
-                240,
-                ID_CAT_LIST,
-            );
-            refresh_category_listbox(lb, &app.categories, *selected_idx);
-
-            let rename_ed = create_ctrl(
-                hwnd,
-                hfont,
-                "EDIT",
-                "",
-                WS_EX_CLIENTEDGE,
-                WS_TABSTOP | (ES_AUTOHSCROLL as u32),
-                12,
-                296,
-                276,
-                22,
-                ID_CAT_RENAME_EDIT,
-            );
-            let rename_ok = create_ctrl(
-                hwnd,
-                hfont,
-                "BUTTON",
-                "保存名称",
-                0,
-                WS_TABSTOP | (BS_PUSHBUTTON as u32),
-                296,
-                295,
-                72,
-                24,
-                ID_CAT_RENAME_OK,
-            );
-            ShowWindow(rename_ed, SW_HIDE);
-            ShowWindow(rename_ok, SW_HIDE);
-
-            create_ctrl(
-                hwnd,
-                hfont,
-                "STATIC",
-                "分类图标:",
-                0,
-                0,
-                12,
-                332,
-                60,
-                18,
-                -1,
-            );
-            create_ctrl(
-                hwnd,
-                hfont,
-                "BUTTON",
-                "切换图标",
-                0,
-                WS_TABSTOP | (BS_PUSHBUTTON as u32),
-                104,
-                328,
-                76,
-                26,
-                ID_CAT_BTN_ICON,
-            );
-            create_ctrl(
-                hwnd,
-                hfont,
-                "BUTTON",
-                "关闭",
-                0,
-                WS_TABSTOP | (BS_DEFPUSHBUTTON as u32),
-                292,
-                328,
-                76,
-                26,
-                IDCANCEL,
-            );
-            SetFocus(lb);
+            crate::category_dialog::populate(hwnd, hfont, app, *selected_idx);
         }
 
         ActiveModal::ColumnSort { selected_idx, .. } => {
@@ -456,6 +359,9 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
             SendMessageW(tab, TCM_INSERTITEMW, 1, &mut item1 as *mut _ as isize);
 
             // 【常规】页签控件
+            create_ctrl(hwnd, hfont, "STATIC", "", 0,
+                0x000D, // SS_OWNERDRAW：由父窗口处理 WM_DRAWITEM。
+                26, 44, 36, 36, ID_EDIT_ICON_PREVIEW);
             create_ctrl(hwnd, hfont, "STATIC", "标题:", 0, 0, 68, 52, 42, 18, ID_EDIT_LBL_TITLE);
             let ed_title = create_ctrl(
                 hwnd,
@@ -697,6 +603,7 @@ pub unsafe fn switch_edit_tab_visibility(hwnd: HWND, active_tab: usize) {
     let show_gen = if active_tab == 0 { SW_SHOW } else { SW_HIDE };
     let show_rem = if active_tab == 1 { SW_SHOW } else { SW_HIDE };
     for id in [
+        ID_EDIT_ICON_PREVIEW,
         ID_EDIT_LBL_TITLE,
         ID_EDIT_TITLE,
         ID_EDIT_LBL_LINK,
@@ -747,7 +654,7 @@ pub(crate) unsafe fn blit_surface_on_bg(
         return;
     }
     let mut bgra = Vec::with_capacity((surf.width * surf.height) as usize);
-    for p in &surf.pixels {
+    for p in surf.pixels() {
         let a = p[3] as u32;
         let inv = 255 - a;
         let r = ((p[0] as u32 * a + bg_rgb[0] as u32 * inv) / 255) as u32;
@@ -789,7 +696,7 @@ pub(crate) unsafe fn blit_surface_on_bg(
 
 /// 绘制原生弹窗中的图像预览与色块（如皮肤缩略图、分类图标、快捷方式图标及 8 色调色板）
 pub unsafe fn paint_native_modal_extras(_hwnd: HWND, hdc: HDC, app: &AppState) {
-    let sys_face = GetSysColor(COLOR_BTNFACE);
+    let sys_face = crate::advanced_style::PAGE;
     let bg_rgb = [
         (sys_face & 0xFF) as u8,
         ((sys_face >> 8) & 0xFF) as u8,
@@ -810,23 +717,9 @@ pub unsafe fn paint_native_modal_extras(_hwnd: HWND, hdc: HDC, app: &AppState) {
                 }
             }
         }
-        ActiveModal::CategoryManager { selected_idx, .. } => {
-            if let Some(cat) = app.categories.get(*selected_idx) {
-                let ico = if cat.icon_name.contains("cube") {
-                    &app.builtin_icons.cat_cube
-                } else {
-                    &app.builtin_icons.cat_laptop
-                };
-                blit_surface_on_bg(hdc, ico, 78, 332, 16, 16, bg_rgb);
-            }
-        }
+        ActiveModal::CategoryManager { .. } => {}
         ActiveModal::EditShortcut(ed) => {
             if ed.active_tab == 0 {
-                if let Some(custom) = &ed.pending_icon_16 {
-                    blit_surface_on_bg(hdc, custom, 32, 48, 16, 16, bg_rgb);
-                } else if let Some(ico) = app.builtin_icons.app_icons.get(&ed.icon_key) {
-                    blit_surface_on_bg(hdc, ico, 32, 48, 16, 16, bg_rgb);
-                }
                 // 当前颜色预览方块
                 let c_ref = ed.text_color.to_colorref();
                 let brush: HBRUSH = CreateSolidBrush(c_ref);

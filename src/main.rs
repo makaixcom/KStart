@@ -27,9 +27,15 @@ mod search;
 mod search_dialog;
 mod skin_assets;
 mod skin_parser;
+mod local_clock;
+mod surface;
+mod file_icons;
+mod canvas;
+mod gdi_renderer;
+use gdi_renderer::{blit_canvas_with_gdi_texts, save_bgra_to_png};
 
 use advanced::Key as Setting;
-use chrono::{Datelike, Local, Weekday};
+use chrono::{Datelike, Weekday};
 use config::{scan_skins, HotkeyConfig, SkinEntry, UserConfig};
 use model::{
     build_context_menu_items, build_item_menu_items, build_popup_menu_items, AppDataStore,
@@ -39,11 +45,11 @@ use renderer::{
     compute_visible_shortcut_rects, hit_test_main, hit_test_modal,
     normalize_rect, rects_intersect, render_main_frame, render_modal_window_frame, ActiveModal,
     ActivePopupMenu, EditShortcutDialogState, EditShortcutField, HitTarget,
-    ModalRenderContext, PopupTextClip, RenderState, TextAlign, TextDrawCmd,
+    ModalRenderContext, RenderState,
     STANDARD_PALETTE,
 };
 use search::{matching_shortcuts, split_run_input, SearchDialogState, SearchMode, SearchResultRow};
-use skin_assets::{extract_file_icon_16, load_custom_icon_16, BuiltinIcons, Canvas, SkinAssets};
+use skin_assets::{extract_file_icon_32, load_custom_icon_16, BuiltinIcons, Canvas, SkinAssets};
 use skin_parser::{RgbColor, SkinConfig, ToolButtonKind};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -56,15 +62,11 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CombineRgn, CreateCompatibleDC, CreateDIBSection, CreateFontW,
-    CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, ExcludeClipRect,
-    FillRect, GetSysColorBrush, InvalidateRect, RedrawWindow, ScreenToClient, SelectClipRgn,
-    SelectObject, SetBkMode,
-    SetTextColor, SetWindowRgn, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, COLOR_BTNFACE,
-    DEFAULT_QUALITY, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, FW_BOLD, FW_NORMAL, GB2312_CHARSET, HBRUSH, HDC,
+    BeginPaint, CombineRgn, CreateFontW, CreateRectRgn, CreateSolidBrush, DeleteObject, EndPaint,
+    FillRect, InvalidateRect, RedrawWindow, ScreenToClient,
+    SetWindowRgn, COLOR_BTNFACE, DEFAULT_QUALITY, FW_NORMAL, GB2312_CHARSET, HBRUSH, HDC,
     HFONT, HRGN, OUT_DEFAULT_PRECIS, PAINTSTRUCT, RDW_INVALIDATE, RDW_NOERASE, RDW_UPDATENOW,
-    RGN_DIFF, SRCCOPY, TRANSPARENT,
+    RGN_DIFF,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -109,8 +111,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_NOTOPMOST, HWND_TOPMOST,
     IDCANCEL, IDC_ARROW, IDC_HAND, IDC_IBEAM, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
     IDOK, LBN_DBLCLK, LBN_SELCHANGE, MB_ICONINFORMATION, MB_OK, MINMAXINFO, MSG, SIZE_MINIMIZED,
-    SM_CXSCREEN, SM_CYSCREEN, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_MINIMIZE,
-    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, WINDOWPOS, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_HOTKEY,
+    SM_CXSCREEN, SM_CYSCREEN, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
+    SW_SHOW, SW_SHOWNORMAL, WINDOWPOS, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_HOTKEY,
     WM_ACTIVATE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_DROPFILES, WM_ERASEBKGND, WM_EXITSIZEMOVE,
     WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_NCACTIVATE,
     WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCPAINT, WM_NOTIFY, WM_PAINT, WM_RBUTTONUP,
@@ -126,6 +128,43 @@ const NATIVE_MODAL_CLASS_NAME: &str = "KStartNativeDialogClass";
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }
+
+#[cfg(test)]
+mod tooltip_clip_tests {
+    use super::*;
+    use crate::renderer::{PopupTextClip, TextAlign, TextDrawCmd};
+
+    #[test]
+    fn tooltip_preserves_uncovered_centered_title_pixels() {
+        let mut canvas = Canvas::new(160, 40);
+        canvas.fill_rect(0, 0, 160, 40, RgbColor::new(255, 255, 255));
+        let texts = vec![TextDrawCmd {
+            text: "Everything".into(), x: 0, y: 0, w: 140, h: 20,
+            color: RgbColor::new(0, 0, 0), bold: false, align: TextAlign::Center,
+            mnemonic: false, multiline: false, font_slot: None,
+        }];
+        let original = blit_canvas_with_gdi_texts(&canvas, &texts, None, 0, true, None).unwrap();
+        let clipped = blit_canvas_with_gdi_texts(&canvas, &texts,
+            Some(PopupTextClip { layers: vec![((80, 0, 60, 24), 1)] }), 0, true, None).unwrap();
+        let mut visible_ink = 0;
+        for y in 0..20 {
+            for x in 0..80 {
+                let index = y * 160 + x;
+                assert_eq!(clipped[index], original[index]);
+                if original[index] & 0x00ff_ffff != 0x00ff_ffff { visible_ink += 1; }
+            }
+            for x in 80..140 {
+                assert_eq!(clipped[y * 160 + x] & 0x00ff_ffff, 0x00ff_ffff);
+            }
+        }
+        assert!(visible_ink > 0, "提示框外必须仍然显示标题文字");
+    }
+}
+
+mod tooltip;
+mod category_dialog;
+#[cfg(test)]
+mod perf_tests;
 
 /// 弹出 Windows 原生文件选择对话框 (`GetOpenFileNameW`)
 fn pick_file_dialog(owner: HWND, title: &str, filter_pairs: &[(&str, &str)]) -> Option<PathBuf> {
@@ -194,7 +233,7 @@ fn pick_folder_dialog(owner: HWND, title: &str) -> Option<PathBuf> {
 
 /// 格式化当前本地日期时间为 `11月18日 星期三 09:02`
 fn format_current_time(settings: &advanced::AdvancedSettings) -> String {
-    let now = Local::now();
+    let now = local_clock::now();
     let weekday_str = match now.weekday() {
         Weekday::Mon => "星期一",
         Weekday::Tue => "星期二",
@@ -386,7 +425,9 @@ impl AppState {
             active_tab: 0,
             title: item.name.clone(),
             target_path: item.target_path.clone(),
-            icon_key: item.icon_key.clone(),
+            icon_key: if item.icon_key == item.id {
+                targets::resolve_path(&self.base_dir, &item.target_path).to_string_lossy().into_owned()
+            } else { item.icon_key.clone() },
             pending_icon_16: item.custom_icon_16.clone(),
             text_color: item.text_color,
             args: item.args.clone(),
@@ -411,7 +452,7 @@ impl AppState {
     ) -> ActiveModal {
         let new_id = self.data_store.next_shortcut_id();
         let icon_key = if pending_icon_16.is_some() {
-            new_id.clone()
+            target_path.clone()
         } else {
             fallback_icon_key.to_string()
         };
@@ -437,7 +478,25 @@ impl AppState {
         })
     }
 
-    fn add_dropped_file(&mut self, file: advanced_runtime::DroppedFile) {
+    fn add_dropped_files(&mut self, files: Vec<advanced_runtime::DroppedFile>) {
+        if files.is_empty() || self.categories.get(self.active_category).is_none() {
+            return;
+        }
+        let first = self.data_store.next_shortcut_number();
+        for (offset, file) in files.into_iter().enumerate() {
+            let Some(number) = u32::try_from(offset)
+                .ok()
+                .and_then(|offset| first.checked_add(offset))
+            else {
+                break;
+            };
+            self.add_dropped_file(file, format!("sc_{number}"));
+        }
+        // 同一批拖入共用一次完整数据提交，避免每加入一项都重写整个 JSON。
+        self.persist_data();
+    }
+
+    fn add_dropped_file(&mut self, file: advanced_runtime::DroppedFile, new_id: String) {
         let Some(cat) = self.categories.get_mut(self.active_category) else {
             return;
         };
@@ -451,14 +510,13 @@ impl AppState {
             });
         }
         let grp_idx = cat.active_group_index.min(cat.groups.len() - 1);
-        let new_id = self.data_store.next_shortcut_id();
         let icon_key = if let Some(ico_surf) = file.icon {
             let user_icon_dir = self.base_dir.join("user").join("icons");
             let _ = fs::create_dir_all(&user_icon_dir);
             let png_path = user_icon_dir.join(format!("{}.png", new_id));
             let _ = ico_surf.save_png(&png_path);
-            self.builtin_icons.app_icons.insert(new_id.clone(), ico_surf);
-            new_id.clone()
+            self.builtin_icons.app_icons.insert(file.icon_source.clone(), ico_surf);
+            file.icon_source.clone()
         } else {
             "app_msedge".to_string()
         };
@@ -483,7 +541,6 @@ impl AppState {
             custom_icon_16,
         });
 
-        self.persist_data();
     }
 }
 
@@ -506,6 +563,9 @@ fn is_native_modal(modal: &ActiveModal) -> bool {
 
 /// 打开或更新独立屏幕居中弹窗窗口（五大管理弹窗采用原生 Win32 控件，关于弹窗保留经典自绘窗口）
 fn show_centered_modal(modal: ActiveModal) {
+    let owner = APP_STATE.with(|cell| cell.try_borrow().ok()
+        .and_then(|guard| guard.as_ref().map(|app| app.main_hwnd)));
+    if let Some(owner) = owner { unsafe { advanced_window::restore_docked(owner); } }
     if let ActiveModal::HotkeyManager(shortcut) = &modal {
         close_modal_window();
         hotkey_dialog::open(shortcut.as_deref());
@@ -556,7 +616,8 @@ fn show_centered_modal(modal: ActiveModal) {
                     }
                 }
             });
-            let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+            let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE
+                | windows_sys::Win32::UI::WindowsAndMessaging::WS_CLIPCHILDREN;
             let ex_style = WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
             let mut wr = RECT {
                 left: 0,
@@ -790,194 +851,6 @@ fn apply_hrgn_safely(hwnd: HWND, hrgn: HRGN) {
     }
 }
 
-/// 通用 GDI DIBSection + 12px 宋体光栅化与呈现函数（供主窗体与独立弹窗共同复用）
-fn blit_canvas_with_gdi_texts(
-    canvas: &Canvas,
-    texts: &[TextDrawCmd],
-    popup_clip: Option<PopupTextClip>,
-    target_hdc: HDC,
-    capture_pixels: bool,
-    settings_fonts: Option<&[advanced::FontSetting; 4]>,
-) -> Option<Vec<u32>> {
-    let w = canvas.width;
-    let h = canvas.height;
-    unsafe {
-        let mem_dc = CreateCompatibleDC(target_hdc);
-        if mem_dc == 0 {
-            return None;
-        }
-
-        let bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB,
-                biSizeImage: 0,
-                biXPelsPerMeter: 0,
-                biYPelsPerMeter: 0,
-                biClrUsed: 0,
-                biClrImportant: 0,
-            },
-            bmiColors: [std::mem::zeroed()],
-        };
-
-        let mut bits_ptr: *mut core::ffi::c_void = ptr::null_mut();
-        let hbm = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, 0, 0);
-        if hbm == 0 || bits_ptr.is_null() {
-            DeleteDC(mem_dc);
-            return None;
-        }
-
-        let old_bm = SelectObject(mem_dc, hbm as _);
-        let pixel_count = (w * h) as usize;
-        let dst_slice = std::slice::from_raw_parts_mut(bits_ptr as *mut u32, pixel_count);
-        dst_slice.copy_from_slice(&canvas.buffer[..pixel_count]);
-
-        let font_name = to_wide("宋体");
-        let hfont_normal: HFONT = CreateFontW(
-            -12,
-            0,
-            0,
-            0,
-            FW_NORMAL as i32,
-            0,
-            0,
-            0,
-            GB2312_CHARSET as u32,
-            OUT_DEFAULT_PRECIS as u32,
-            0,
-            DEFAULT_QUALITY as u32,
-            0,
-            font_name.as_ptr(),
-        );
-        let hfont_bold: HFONT = CreateFontW(
-            -12,
-            0,
-            0,
-            0,
-            FW_BOLD as i32,
-            0,
-            0,
-            0,
-            GB2312_CHARSET as u32,
-            OUT_DEFAULT_PRECIS as u32,
-            0,
-            DEFAULT_QUALITY as u32,
-            0,
-            font_name.as_ptr(),
-        );
-
-        SetBkMode(mem_dc, TRANSPARENT as i32);
-        let old_font = SelectObject(mem_dc, hfont_normal as _);
-        let mut custom_fonts = [0; 4];
-        if let Some(fonts) = settings_fonts {
-            for (index, font) in fonts.iter().enumerate() {
-                if font.face == "宋体" && font.points == 9 { continue; }
-                let face = to_wide(&font.face);
-                custom_fonts[index] = CreateFontW(
-                    -(font.points.clamp(5, 48) * 96 / 72), 0, 0, 0, FW_NORMAL as i32,
-                    0, 0, 0, GB2312_CHARSET as u32, OUT_DEFAULT_PRECIS as u32, 0,
-                    DEFAULT_QUALITY as u32, 0, face.as_ptr(),
-                );
-            }
-        }
-
-        let draw_text = |cmd: &TextDrawCmd| {
-            let font = cmd.font_slot.and_then(|index| custom_fonts.get(index).copied())
-                .filter(|&font| font != 0);
-            SelectObject(
-                mem_dc,
-                if let Some(font) = font {
-                    font
-                } else if cmd.bold {
-                    hfont_bold as _
-                } else {
-                    hfont_normal as _
-                },
-            );
-            SetTextColor(mem_dc, cmd.color.to_colorref());
-
-            let mut rc = RECT {
-                left: cmd.x,
-                top: cmd.y,
-                right: cmd.x + cmd.w,
-                bottom: cmd.y + cmd.h,
-            };
-            let wide_text = to_wide(&cmd.text);
-            let mut flags = if cmd.multiline {
-                DT_WORDBREAK
-            } else {
-                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS
-            };
-            flags |= match cmd.align {
-                TextAlign::Left => DT_LEFT,
-                TextAlign::Center => DT_CENTER,
-            };
-            if !cmd.mnemonic {
-                flags |= DT_NOPREFIX;
-            }
-            DrawTextW(
-                mem_dc,
-                wide_text.as_ptr(),
-                (wide_text.len().saturating_sub(1)) as i32,
-                &mut rc,
-                flags,
-            );
-        };
-
-        if let Some(clip) = popup_clip {
-            let (under_menu, menu) = texts.split_at(clip.first_menu_command);
-            let (x, y, width, height) = clip.rect;
-            ExcludeClipRect(mem_dc, x, y, x + width, y + height);
-            under_menu.iter().for_each(draw_text);
-            SelectClipRgn(mem_dc, 0);
-            menu.iter().for_each(draw_text);
-        } else {
-            texts.iter().for_each(draw_text);
-        }
-
-        if target_hdc != 0 {
-            BitBlt(target_hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
-        }
-
-        let captured = if capture_pixels {
-            Some(dst_slice.to_vec())
-        } else {
-            None
-        };
-
-        SelectObject(mem_dc, old_font);
-        for font in custom_fonts.into_iter().filter(|&font| font != 0) {
-            DeleteObject(font);
-        }
-        SelectObject(mem_dc, old_bm);
-        DeleteObject(hfont_normal as _);
-        DeleteObject(hfont_bold as _);
-        DeleteObject(hbm as _);
-        DeleteDC(mem_dc);
-
-        captured
-    }
-}
-
-/// 将 `Canvas` 与捕获到的像素保存为 PNG 截图文件
-fn save_bgra_to_png(w: u32, h: u32, bgra: Vec<u32>, out_path: &Path) -> Result<(), String> {
-    let mut rgba_bytes = Vec::with_capacity((w * h * 4) as usize);
-    for px in bgra {
-        let b = (px & 0xFF) as u8;
-        let g = ((px >> 8) & 0xFF) as u8;
-        let r = ((px >> 16) & 0xFF) as u8;
-        rgba_bytes.extend_from_slice(&[r, g, b, 255]);
-    }
-    let img_buf = image::RgbaImage::from_raw(w, h, rgba_bytes).ok_or("创建 RgbaImage 失败")?;
-    img_buf
-        .save(out_path)
-        .map_err(|e| format!("保存截图失败: {}", e))
-}
-
 /// 启动快捷方式或打开网址
 fn launch_target_url_or_path(target: &str, args: &str, work_dir: &str, hwnd: HWND) -> bool {
     let op = to_wide("open");
@@ -1033,8 +906,7 @@ fn launch_typed_target(
                         advanced_window::hide_after_launch(hwnd, 2, false, false);
                     }
                     "/AH/" | "kstart:app-show" => {
-                        ShowWindow(hwnd, SW_RESTORE);
-                        SetForegroundWindow(hwnd);
+                        advanced_window::activate_main(hwnd);
                     }
                     "kstart:app-hide" => advanced_window::hide_after_launch(hwnd, 2, false, false),
                     "kstart:app-hotkeys" => show_centered_modal(ActiveModal::HotkeyManager(None)),
@@ -1131,19 +1003,18 @@ fn launch_configured_url(url: &str, owner: HWND, settings: &advanced::AdvancedSe
 }
 
 unsafe fn request_main_close(hwnd: HWND, from_menu: bool) {
+    advanced_window::save_position(hwnd);
     let action = APP_STATE.with(|cell| {
         let guard = cell.try_borrow().ok()?;
         let app = guard.as_ref()?;
         let settings = &app.user_cfg.advanced;
-        if app.user_cfg.startup_lock && settings.enabled(Setting::BlockLockedExit) {
-            Some(0)
-        } else if !from_menu && settings.enabled(Setting::CloseMinimizes) {
-            Some(1)
-        } else { Some(2) }
+        if !from_menu && settings.enabled(Setting::CloseMinimizes) { Some(1) }
+        else if app.user_cfg.startup_lock && settings.enabled(Setting::BlockLockedExit) { Some(0) }
+        else { Some(2) }
     });
     match action {
         Some(0) => advanced_runtime::message(hwnd, "请先解除锁定再退出 KStart。"),
-        Some(1) => { ShowWindow(hwnd, SW_MINIMIZE); advanced_window::update_tray(hwnd); }
+        Some(1) => advanced_window::minimize_main(hwnd),
         Some(2) => { DestroyWindow(hwnd); }
         _ => {}
     }
@@ -1348,6 +1219,7 @@ fn handle_main_menu_action(app: &mut AppState, action: MenuAction) -> Option<Act
         }
         MenuAction::ToggleEnableList => {
             app.user_cfg.enable_list = !app.user_cfg.enable_list;
+            app.advanced_window.visibility_dirty = true;
             app.user_cfg.save(&app.base_dir);
             None
         }
@@ -1359,6 +1231,7 @@ fn handle_main_menu_action(app: &mut AppState, action: MenuAction) -> Option<Act
         }
         MenuAction::OpenAdvancedOptions => {
             app.popup_menu = ActivePopupMenu::None;
+            app.advanced_window.advanced_page = 0;
             Some(ActiveModal::Advanced(app.user_cfg.advanced.clone()))
         }
         MenuAction::OpenHotkeyManager => {
@@ -1390,6 +1263,9 @@ enum DeferredDialogRequest {
     EditPickDir,
     EditPickIcon,
     AboutCheckUpdate,
+    CategoryPickIcon(usize),
+    CategoryAddIcon(usize),
+    CategoryManageIcons,
 }
 
 /// 处理内容区空白处右键菜单项点击（16 项）
@@ -1450,7 +1326,11 @@ fn handle_context_menu_action(
             DeferredDialogRequest::None,
         ),
         ContextMenuAction::AppearanceSetting => {
-            (Some(ActiveModal::SkinManager), DeferredDialogRequest::None)
+            app.advanced_window.advanced_page = 3;
+            (
+                Some(ActiveModal::Advanced(app.user_cfg.advanced.clone())),
+                DeferredDialogRequest::None,
+            )
         }
         ContextMenuAction::SortShortcuts => {
             if let Some(cat) = app.categories.get_mut(cat_idx) {
@@ -1879,11 +1759,31 @@ unsafe extern "system" fn main_wnd_proc(
 
         // 窗体真实尺寸改变后再更新宽高、画布、四角异形裁剪并立即同步重绘（避免放大时裁剪区域滞后或右侧留白）
         WM_MOVE | WM_ACTIVATE if msg == WM_MOVE || wparam & 0xFFFF == 0 => {
-            popup::dismiss_visible(hwnd);
+            if msg == WM_MOVE || !popup::is_popup_window(lparam as HWND) {
+                popup::dismiss_with_owner(hwnd);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND
+            if wparam & 0xfff0 == windows_sys::Win32::UI::WindowsAndMessaging::SC_MINIMIZE as usize => {
+            advanced_window::minimize_main(hwnd);
+            0
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND
+            if wparam & 0xfff0 == windows_sys::Win32::UI::WindowsAndMessaging::SC_RESTORE as usize => {
+            APP_STATE.with(|cell| { if let Ok(mut guard) = cell.try_borrow_mut() {
+                if let Some(app) = guard.as_mut() {
+                    app.user_cfg.enable_list = true;
+                    app.advanced_window.visibility_dirty = false;
+                    app.advanced_window.popup_hidden = false;
+                    app.user_cfg.save(&app.base_dir);
+                }
+            }});
+            advanced_window::restore_docked(hwnd);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_SIZE => {
-            popup::dismiss_visible(hwnd);
+            popup::dismiss_with_owner(hwnd);
             if wparam != SIZE_MINIMIZED as usize {
                 let mut cr = RECT {
                     left: 0,
@@ -1933,7 +1833,28 @@ unsafe extern "system" fn main_wnd_proc(
         }
 
         // 拖拽缩放结束后二次校验裁剪区域并保存新窗口大小至 `user/config.ini`
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_ENTERSIZEMOVE => {
+            advanced_window::restore_docked(hwnd);
+            0
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVING => {
+            let proposed = lparam as *mut RECT;
+            if !proposed.is_null() {
+                let mut pointer: POINT = std::mem::zeroed();
+                windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pointer);
+                let monitor = windows_sys::Win32::Graphics::Gdi::MonitorFromPoint(pointer,
+                    windows_sys::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST);
+                let mut info: windows_sys::Win32::Graphics::Gdi::MONITORINFO = std::mem::zeroed();
+                info.cbSize = std::mem::size_of_val(&info) as u32;
+                if windows_sys::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut info) != 0 {
+                    *proposed = advanced_window::constrain_to_work_area(*proposed, info.rcWork);
+                }
+            }
+            1
+        }
         WM_EXITSIZEMOVE => {
+            let mut position: RECT = std::mem::zeroed();
+            let has_position = windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut position) != 0 && IsIconic(hwnd) == 0;
             let mut cr = RECT {
                 left: 0,
                 top: 0,
@@ -1959,6 +1880,8 @@ unsafe extern "system" fn main_wnd_proc(
                                 );
                             }
                         }
+                        if has_position { app.user_cfg.window_position = Some((position.left, position.top)); }
+                        app.advanced_window.stretch_pending = true;
                         app.user_cfg.save(&app.base_dir);
                     }
                 }
@@ -1973,6 +1896,7 @@ unsafe extern "system" fn main_wnd_proc(
                 );
             }
             advanced_window::stretch_docked(hwnd);
+            advanced_window::save_position(hwnd);
             0
         }
 
@@ -2055,7 +1979,7 @@ unsafe extern "system" fn main_wnd_proc(
                     APP_STATE.with(|cell| {
                         if let Ok(mut guard) = cell.try_borrow_mut() {
                             if let Some(app) = guard.as_mut() {
-                                for file in files { app.add_dropped_file(file); }
+                                app.add_dropped_files(files);
                             }
                         }
                     });
@@ -2065,9 +1989,35 @@ unsafe extern "system" fn main_wnd_proc(
             0
         }
 
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_CAPTURECHANGED
+        | windows_sys::Win32::UI::WindowsAndMessaging::WM_CANCELMODE => {
+            APP_STATE.with(|cell| {
+                if let Ok(mut guard) = cell.try_borrow_mut() {
+                    if let Some(app) = guard.as_mut() {
+                        app.advanced_window.shortcut_scroll_grab = None;
+                        if matches!(app.down_target, HitTarget::ListScroll(_)) {
+                            app.down_target = HitTarget::None;
+                        }
+                    }
+                }
+            });
+            0
+        }
         WM_MOUSEMOVE => {
             let mx = (lparam & 0xFFFF) as i16 as i32;
             let my = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+            let scrolling = APP_STATE.with(|cell| {
+                let mut guard = cell.try_borrow_mut().ok()?;
+                let app = guard.as_mut()?;
+                let grab = app.advanced_window.shortcut_scroll_grab?;
+                let grid = advanced_list_grid(app)?;
+                app.advanced_window.shortcut_scroll = grid.scroll_during_drag(my, grab);
+                Some(())
+            }).is_some();
+            if scrolling {
+                RedrawWindow(hwnd, ptr::null(), 0, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+                return 0;
+            }
             APP_STATE.with(|cell| {
                 if let Ok(mut guard) = cell.try_borrow_mut() {
                     if let Some(app) = guard.as_mut() {
@@ -2186,6 +2136,19 @@ unsafe extern "system" fn main_wnd_proc(
                             app.search_focused = target == HitTarget::SearchBox;
                         }
                         app.down_target = target;
+                        if let HitTarget::ListScroll(offset) = target {
+                            if let Some(grid) = advanced_list_grid(app) {
+                                let current = app.advanced_window.shortcut_scroll;
+                                app.advanced_window.shortcut_scroll_grab = grid.scrollbar_grab(offset, current);
+                                if let Some(grab) = app.advanced_window.shortcut_scroll_grab {
+                                    app.advanced_window.shortcut_scroll = grid.scroll_during_drag(my, grab);
+                                } else {
+                                    app.advanced_window.shortcut_scroll = if offset < 14 {
+                                        current.saturating_sub(1)
+                                    } else { (current + 1).min(grid.max_scroll) };
+                                }
+                            }
+                        }
                         InvalidateRect(hwnd, ptr::null(), 0);
 
                         if target == HitTarget::DragCaption && !app.user_cfg.lock_move {
@@ -2210,7 +2173,7 @@ unsafe extern "system" fn main_wnd_proc(
             let item = APP_STATE.with(|cell| {
                 let guard = cell.try_borrow().ok()?;
                 let app = guard.as_ref()?;
-                if !app.user_cfg.advanced.enabled(Setting::DoubleClick) { return None; }
+                if !app.user_cfg.advanced.launch_on_click(true) { return None; }
                 let HitTarget::ShortcutItem(index) = hit_test_main(x, y, app.user_cfg.window_width,
                     app.user_cfg.window_height, &app.skin_cfg, &app.skin_assets, &app.categories,
                     app.active_category, &app.user_cfg.advanced, app.advanced_window.shortcut_scroll
@@ -2223,6 +2186,17 @@ unsafe extern "system" fn main_wnd_proc(
         WM_LBUTTONUP | popup::WM_SELECT => {
             let from_popup = msg == popup::WM_SELECT;
             if !from_popup { ReleaseCapture(); }
+            if !from_popup {
+                let scrolled = APP_STATE.with(|cell| {
+                    let mut guard = cell.try_borrow_mut().ok()?;
+                    let app = guard.as_mut()?;
+                    if !matches!(app.down_target, HitTarget::ListScroll(_)) { return None; }
+                    app.advanced_window.shortcut_scroll_grab = None;
+                    app.down_target = HitTarget::None;
+                    Some(())
+                }).is_some();
+                if scrolled { InvalidateRect(hwnd, ptr::null(), 0); return 0; }
+            }
             let mx = (lparam & 0xFFFF) as i16 as i32;
             let my = ((lparam >> 16) & 0xFFFF) as i16 as i32;
             let mut modal_to_open: Option<ActiveModal> = None;
@@ -2232,6 +2206,7 @@ unsafe extern "system" fn main_wnd_proc(
             let mut browse_location = None;
             let mut shortcut_to_launch = None;
             let mut close_requested = false;
+            let mut minimize_requested = false;
             let mut lock_change = None;
             let mut confirm_delete = None;
 
@@ -2348,7 +2323,7 @@ unsafe extern "system" fn main_wnd_proc(
                                     app.popup_menu = ActivePopupMenu::None;
                                 }
                                 HitTarget::TitleMin => {
-                                    ShowWindow(hwnd, SW_MINIMIZE);
+                                    minimize_requested = true;
                                 }
                                 HitTarget::TitleClose => {
                                     close_requested = true;
@@ -2442,7 +2417,7 @@ unsafe extern "system" fn main_wnd_proc(
                                             .min(cat.groups.len().saturating_sub(1));
                                         if let Some(grp) = cat.groups.get(grp_idx) {
                                             if let Some(item) = grp.items.get(item_idx) {
-                                                if !app.user_cfg.advanced.enabled(Setting::DoubleClick) {
+                                                if app.user_cfg.advanced.launch_on_click(false) {
                                                     shortcut_to_launch = Some(item.clone());
                                                 }
                                             }
@@ -2470,6 +2445,9 @@ unsafe extern "system" fn main_wnd_proc(
                                         if let Some(rgn) = app.switch_skin(q_idx) {
                                             skin_hrgn = rgn;
                                         }
+                                    } else if q_idx == app.skins.len() {
+                                        app.advanced_window.advanced_page = 3;
+                                        modal_to_open = Some(ActiveModal::Advanced(app.user_cfg.advanced.clone()));
                                     } else if q_idx == app.skins.len() + 1 {
                                         modal_to_open = Some(ActiveModal::SkinManager);
                                     }
@@ -2516,6 +2494,7 @@ unsafe extern "system" fn main_wnd_proc(
                 }
             }
             if close_requested { request_main_close(hwnd, from_popup); }
+            if minimize_requested { advanced_window::minimize_main(hwnd); }
             if let Some((base, locked)) = lock_change {
                 if !locked || advanced_prompt::authenticate(hwnd, &base, true) {
                     APP_STATE.with(|cell| {
@@ -2578,7 +2557,7 @@ unsafe extern "system" fn main_wnd_proc(
                             .parent()
                             .map(|p| p.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        let icon_16 = extract_file_icon_16(&picked);
+                        let icon_16 = extract_file_icon_32(&picked);
                         APP_STATE.with(|cell| {
                             if let Ok(guard) = cell.try_borrow() {
                                 if let Some(app) = guard.as_ref() {
@@ -2603,7 +2582,7 @@ unsafe extern "system" fn main_wnd_proc(
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| picked.to_string_lossy().to_string());
                         let target_path = picked.to_string_lossy().to_string();
-                        let icon_16 = extract_file_icon_16(&picked);
+                        let icon_16 = extract_file_icon_32(&picked);
                         APP_STATE.with(|cell| {
                             if let Ok(guard) = cell.try_borrow() {
                                 if let Some(app) = guard.as_ref() {
@@ -2812,7 +2791,7 @@ unsafe extern "system" fn main_wnd_proc(
                             list_background: app.list_background.as_ref(),
                             shortcut_scroll: app.advanced_window.shortcut_scroll,
                             volume_level: app.advanced_window.volume_indicator.map(|(level, _)| level),
-                            tooltip: app.advanced_window.tooltip.as_ref().filter(|_| app.popup_menu == ActivePopupMenu::None),
+                            tooltip: None,
                             search_query: &app.search_query,
                             search_focused: app.search_focused,
                             popup_menu: ActivePopupMenu::None,
@@ -3294,7 +3273,7 @@ unsafe extern "system" fn modal_wnd_proc(
                             .parent()
                             .map(|p| p.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        let icon_16 = extract_file_icon_16(&picked);
+                        let icon_16 = extract_file_icon_32(&picked);
                         APP_STATE.with(|cell| {
                             if let Ok(mut guard) = cell.try_borrow_mut() {
                                 if let Some(app) = guard.as_mut() {
@@ -3306,7 +3285,7 @@ unsafe extern "system" fn modal_wnd_proc(
                                         ed.work_dir = work_dir;
                                         if let Some(ico) = icon_16 {
                                             ed.pending_icon_16 = Some(ico);
-                                            ed.icon_key = ed.shortcut_id.clone();
+                                            ed.icon_key = picked.to_string_lossy().into_owned();
                                         }
                                     }
                                 }
@@ -3321,7 +3300,7 @@ unsafe extern "system" fn modal_wnd_proc(
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| picked.to_string_lossy().to_string());
                         let target_path = picked.to_string_lossy().to_string();
-                        let icon_16 = extract_file_icon_16(&picked);
+                        let icon_16 = extract_file_icon_32(&picked);
                         APP_STATE.with(|cell| {
                             if let Ok(mut guard) = cell.try_borrow_mut() {
                                 if let Some(app) = guard.as_mut() {
@@ -3332,7 +3311,7 @@ unsafe extern "system" fn modal_wnd_proc(
                                         ed.target_path = target_path;
                                         if let Some(ico) = icon_16 {
                                             ed.pending_icon_16 = Some(ico);
-                                            ed.icon_key = ed.shortcut_id.clone();
+                                            ed.icon_key = picked.to_string_lossy().into_owned();
                                         }
                                     }
                                 }
@@ -3358,7 +3337,7 @@ unsafe extern "system" fn modal_wnd_proc(
                                     if let Some(app) = guard.as_mut() {
                                         if let ActiveModal::EditShortcut(ed) = &mut app.modal {
                                             ed.pending_icon_16 = Some(ico);
-                                            ed.icon_key = ed.shortcut_id.clone();
+                                            ed.icon_key = picked.to_string_lossy().into_owned();
                                         }
                                     }
                                 }
@@ -3608,12 +3587,16 @@ unsafe extern "system" fn native_modal_wnd_proc(
             0
         }
 
-        WM_ERASEBKGND if is_advanced() => 1,
-        WM_CTLCOLORSTATIC if is_advanced() => advanced_style::static_color(wparam as HDC) as LRESULT,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_HSCROLL if is_advanced() => {
+            advanced_dialog::update_opacity_value(hwnd, lparam as HWND, wparam);
+            0
+        }
+        WM_ERASEBKGND => {
+            advanced_style::erase_background(hwnd, wparam as HDC);
+            1
+        }
         WM_CTLCOLORSTATIC => {
-            let hdc = wparam as HDC;
-            SetBkMode(hdc, TRANSPARENT as i32);
-            GetSysColorBrush(COLOR_BTNFACE) as LRESULT
+            advanced_style::static_color(wparam as HDC) as LRESULT
         }
 
         WM_DRAWITEM => {
@@ -3621,6 +3604,31 @@ unsafe extern "system" fn native_modal_wnd_proc(
             if !dis.is_null() {
                 let d = &*dis;
                 let cid = d.CtlID as i32;
+                let category_drawn = APP_STATE.with(|cell| {
+                    let Ok(guard) = cell.try_borrow() else { return false; };
+                    let Some(app) = guard.as_ref() else { return false; };
+                    category_dialog::draw(d, app, GetWindowLongPtrW(hwnd, GWLP_USERDATA) as HFONT)
+                });
+                if category_drawn { return 1; }
+                if cid == native_dialogs::ID_EDIT_ICON_PREVIEW {
+                    FillRect(d.hDC, &d.rcItem, advanced_style::static_color(d.hDC));
+                    APP_STATE.with(|cell| {
+                        if let Ok(guard) = cell.try_borrow() {
+                            if let Some(app) = guard.as_ref() {
+                                if let ActiveModal::EditShortcut(ed) = &app.modal {
+                                    if let Some(icon) = ed.pending_icon_16.as_ref()
+                                        .or_else(|| app.builtin_icons.app_icons.get(&ed.icon_key)) {
+                                        let color = advanced_style::PAGE;
+                                        let preview = icon.resize_to(32, 32);
+                                        native_dialogs::blit_surface_on_bg(d.hDC, &preview, 2, 2, 32, 32,
+                                            [color as u8, (color >> 8) as u8, (color >> 16) as u8]);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    return 1;
+                }
                 if cid == advanced_dialog::ID_PAGE {
                     advanced_style::draw_navigation(d, GetWindowLongPtrW(hwnd, GWLP_USERDATA) as HFONT);
                     return 1;
@@ -3661,6 +3669,9 @@ unsafe extern "system" fn native_modal_wnd_proc(
                 EndPaint(hwnd, &ps);
                 return 0;
             }
+            // 标签页覆盖父窗口绘制区域，预览由独立子控件负责刷新。
+            let preview = GetDlgItem(hwnd, native_dialogs::ID_EDIT_ICON_PREVIEW);
+            if preview != 0 { InvalidateRect(preview, ptr::null(), 1); }
             APP_STATE.with(|cell| {
                 if let Ok(guard) = cell.try_borrow() {
                     if let Some(app) = guard.as_ref() {
@@ -3882,18 +3893,13 @@ unsafe extern "system" fn native_modal_wnd_proc(
                                         );
                                     }
                                 } else if ctrl_id == native_dialogs::ID_CAT_BTN_ICON {
-                                    if let Some(cat) = app.categories.get_mut(*selected_idx) {
-                                        cat.icon_name = if cat.icon_name.contains("cube") {
-                                            "cat_laptop".to_string()
-                                        } else {
-                                            "cat_cube".to_string()
-                                        };
-                                        need_persist = true;
-                                    }
-                                    InvalidateRect(hwnd, ptr::null(), 1);
+                                    deferred = DeferredDialogRequest::CategoryPickIcon(*selected_idx);
+                                } else if ctrl_id == native_dialogs::ID_CAT_ADD_ICON {
+                                    deferred = DeferredDialogRequest::CategoryAddIcon(*selected_idx);
+                                } else if ctrl_id == native_dialogs::ID_CAT_MANAGE_ICONS {
+                                    deferred = DeferredDialogRequest::CategoryManageIcons;
                                 }
                             }
-
                             ActiveModal::ColumnSort { selected_idx, .. } => {
                                 let lb = GetDlgItem(hwnd, native_dialogs::ID_COL_LIST);
                                 let cat_idx = app.active_category;
@@ -3973,6 +3979,9 @@ unsafe extern "system" fn native_modal_wnd_proc(
 
             // 借用释放后再弹出原生文件/目录/图标选择框
             match deferred {
+                DeferredDialogRequest::CategoryPickIcon(index) => category_dialog::pick(hwnd, index),
+                DeferredDialogRequest::CategoryAddIcon(index) => category_dialog::add(hwnd, index),
+                DeferredDialogRequest::CategoryManageIcons => category_dialog::manage(hwnd),
                 DeferredDialogRequest::EditPickFile => {
                     if let Some(picked) = pick_file_dialog(
                         hwnd,
@@ -3992,8 +4001,11 @@ unsafe extern "system" fn native_modal_wnd_proc(
                             .parent()
                             .map(|p| p.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        let icon_16 = extract_file_icon_16(&picked);
+                        let icon_16 = extract_file_icon_32(&picked);
                         native_dialogs::set_ctrl_text(hwnd, native_dialogs::ID_EDIT_PATH, &path_str);
+                        if icon_16.is_some() {
+                            native_dialogs::set_ctrl_text(hwnd, native_dialogs::ID_EDIT_ICON, &path_str);
+                        }
                         if native_dialogs::get_ctrl_text(hwnd, native_dialogs::ID_EDIT_TITLE)
                             .trim()
                             .is_empty()
@@ -4031,8 +4043,11 @@ unsafe extern "system" fn native_modal_wnd_proc(
                             .file_name()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| path_str.clone());
-                        let icon_16 = extract_file_icon_16(&picked);
+                        let icon_16 = extract_file_icon_32(&picked);
                         native_dialogs::set_ctrl_text(hwnd, native_dialogs::ID_EDIT_PATH, &path_str);
+                        if icon_16.is_some() {
+                            native_dialogs::set_ctrl_text(hwnd, native_dialogs::ID_EDIT_ICON, &path_str);
+                        }
                         if native_dialogs::get_ctrl_text(hwnd, native_dialogs::ID_EDIT_TITLE)
                             .trim()
                             .is_empty()
@@ -4274,7 +4289,8 @@ fn main() {
     unsafe {
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES,
+            dwICC: ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES
+                | windows_sys::Win32::UI::Controls::ICC_BAR_CLASSES,
         };
         InitCommonControlsEx(&icc);
 
@@ -4288,7 +4304,7 @@ fn main() {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinstance,
-            hIcon: 0,
+            hIcon: windows_sys::Win32::UI::WindowsAndMessaging::LoadIconW(hinstance, 1usize as *const u16),
             hCursor: LoadCursorW(0, IDC_ARROW),
             hbrBackground: 0,
             lpszMenuName: ptr::null(),
@@ -4331,8 +4347,19 @@ fn main() {
 
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        let start_x = ((screen_w - win_w) / 2).max(20);
-        let start_y = ((screen_h - win_h) / 2).max(20);
+        let saved_position = APP_STATE.with(|cell| cell.try_borrow().ok()
+            .and_then(|guard| guard.as_ref().and_then(|app| app.user_cfg.window_position)));
+        let (mut start_x, mut start_y) = saved_position.unwrap_or(
+            (((screen_w - win_w) / 2).max(20), ((screen_h - win_h) / 2).max(20)));
+        let bounds = RECT { left: start_x, top: start_y, right: start_x + win_w, bottom: start_y + win_h };
+        let monitor = windows_sys::Win32::Graphics::Gdi::MonitorFromRect(&bounds,
+            windows_sys::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST);
+        let mut info: windows_sys::Win32::Graphics::Gdi::MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of_val(&info) as u32;
+        if windows_sys::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut info) != 0 {
+            start_x = start_x.clamp(info.rcWork.left, (info.rcWork.right - win_w).max(info.rcWork.left));
+            start_y = start_y.clamp(info.rcWork.top, (info.rcWork.bottom - win_h).max(info.rcWork.top));
+        }
 
         let ex_style = if always_on_top {
             WS_EX_TOPMOST
@@ -4345,7 +4372,7 @@ fn main() {
             ex_style,
             main_cls.as_ptr(),
             win_title.as_ptr(),
-            WS_POPUP | WS_THICKFRAME | WS_VISIBLE | WS_SYSMENU | WS_MINIMIZEBOX,
+            WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX,
             start_x,
             start_y,
             win_w,
@@ -4386,10 +4413,12 @@ fn main() {
             }
         });
         apply_hrgn_safely(hwnd, init_hrgn);
+        advanced_window::apply_opacity(hwnd);
 
         SetTimer(hwnd, 1, 10_000, None);
         SetTimer(hwnd, advanced_window::TIMER_ID, 100, None);
-        ShowWindow(hwnd, SW_SHOWNORMAL);
+        advanced_window::stretch_docked(hwnd);
+        advanced_window::sync_list_visibility(hwnd);
         popup::sync(hwnd);
         advanced_window::update_tray(hwnd);
         hotkeys::sync(hwnd);
