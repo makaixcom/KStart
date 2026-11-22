@@ -41,8 +41,8 @@ const TEXT: i32 = 1323;
 const CONTROLS: i32 = 1330;
 const TEXT_BODY: i32 = 1331;
 const TAB: i32 = 1340;
-const SYSTEM_LEFT: i32 = 1341;
-const SYSTEM_RIGHT: i32 = 1342;
+const SYSTEM_LIST: i32 = 1341;
+const SYSTEM_REPEAT: i32 = 1342;
 
 const FILTERS: &[&str] = &[
     "所有",
@@ -104,6 +104,7 @@ enum Dialog {
     System {
         tab: usize,
         selected: Option<Choice>,
+        destination: Option<(usize, usize)>,
     },
 }
 
@@ -141,7 +142,7 @@ pub fn open(shortcut: Option<&str>) {
 }
 
 unsafe fn show(owner: HWND, title: &str, size: (i32, i32), dialog: Dialog) -> Option<Dialog> {
-    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_CENTER as u32;
+    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | DS_CENTER as u32;
     let mut template = vec![
         style as u16,
         (style >> 16) as u16,
@@ -370,6 +371,7 @@ fn describe(binding: &Binding) -> (usize, String, String) {
 unsafe fn refresh(hwnd: HWND, manager: &mut Manager, selected: Option<usize>) {
     let list = GetDlgItem(hwnd, LIST);
     SendMessageW(list, WM_SETREDRAW, 0, 0);
+    RemovePropW(list,to_wide(SYSTEM_HOVER).as_ptr());
     SendMessageW(list, LVM_DELETEALLITEMS, 0, 0);
     manager.visible.clear();
     for (index, (key, binding)) in manager.config.bindings.iter().enumerate() {
@@ -970,6 +972,7 @@ pub unsafe fn choose_system(owner: HWND) -> Option<Choice> {
         Dialog::System {
             tab: 0,
             selected: None,
+            destination: None,
         },
     ) {
         Some(Dialog::System { selected, .. }) => selected,
@@ -981,20 +984,16 @@ unsafe fn add_list_item(list: HWND, title: &str) {
     SendMessageW(list, LB_ADDSTRING, 0, to_wide(title).as_ptr() as LPARAM);
 }
 
-unsafe fn populate_system(hwnd: HWND) {
-    let tab = create_ctrl(
-        hwnd,
-        font(),
-        "SysTabControl32",
-        "",
-        0,
-        WS_TABSTOP,
-        14,
-        14,
-        364,
-        355,
-        TAB,
-    );
+/// 快捷方式入口可连续单击添加；热键入口只选择一个目标。
+pub unsafe fn add_system_shortcuts(owner: HWND, category: usize, group: usize) {
+    show(owner, "添加系统功能", (392, 426), Dialog::System {
+        tab: 0, selected: None, destination: Some((category, group)),
+    });
+}
+
+unsafe fn populate_system(hwnd: HWND, multiple: bool) {
+    let tab = create_ctrl(hwnd, font(), "SysTabControl32", "", 0, WS_TABSTOP,
+        14, 14, 364, 26, TAB);
     for (index, title) in TABS.iter().enumerate() {
         let mut text = to_wide(title);
         let mut item: TCITEMW = mem::zeroed();
@@ -1002,85 +1001,198 @@ unsafe fn populate_system(hwnd: HWND) {
         item.pszText = text.as_mut_ptr();
         SendMessageW(tab, TCM_INSERTITEMW, index, &item as *const _ as LPARAM);
     }
-    for (index, id) in [SYSTEM_LEFT, SYSTEM_RIGHT].into_iter().enumerate() {
-        let list = create_ctrl(
-            hwnd,
-            font(),
-            "LISTBOX",
-            "",
-            WS_EX_CLIENTEDGE,
-            WS_TABSTOP
-                | WS_VSCROLL
-                | LBS_NOTIFY as u32
-                | LBS_OWNERDRAWFIXED as u32
-                | LBS_HASSTRINGS as u32
-                | LBS_NOINTEGRALHEIGHT as u32,
-            22 + index as i32 * 176,
-            42,
-            174,
-            316,
-            id,
-        );
-        SendMessageW(list, LB_SETITEMHEIGHT, 0, 23);
-        SetWindowSubclass(list, Some(system_list_key), 1, 0);
+    // 页签只占顶部，不与白色列表重叠，避免缩放时页签背景盖住列表。
+    let list = create_ctrl(hwnd, font(), "SysListView32", "", WS_EX_CLIENTEDGE,
+        WS_TABSTOP | WS_CLIPSIBLINGS | LVS_SMALLICON | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        14, 42, 364, 316, SYSTEM_LIST);
+    SendMessageW(list, LVM_SETBKCOLOR, 0, 0x00ffffff);
+    SendMessageW(list, LVM_SETTEXTBKCOLOR, 0, 0x00ffffff);
+    SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_DOUBLEBUFFER as LPARAM);
+    SetWindowSubclass(list, Some(system_list_key), 1, 0);
+    if multiple {
+        create_ctrl(hwnd, font(), "BUTTON", "允许一次添加多个(&M)", 0,
+            WS_TABSTOP | BS_AUTOCHECKBOX as u32, 14, 386, 240, 24, SYSTEM_REPEAT);
     }
     button(hwnd, IDCANCEL, "关闭", 304, 386, 73);
     refresh_system(hwnd, 0);
 }
 
-unsafe extern "system" fn system_list_key(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _: usize,
-    _: usize,
-) -> isize {
-    let enter = wparam as u16 == VK_RETURN;
-    if message == WM_GETDLGCODE && enter {
-        return DLGC_WANTALLKEYS as isize;
+const SYSTEM_HOVER: &str = "KStart.SystemHover";
+
+unsafe fn system_hit(list: HWND, point: windows_sys::Win32::Foundation::POINT) -> isize {
+    let mut hit: LVHITTESTINFO = mem::zeroed();
+    hit.pt = point;
+    SendMessageW(list, LVM_HITTEST, 0, &mut hit as *mut _ as LPARAM)
+}
+
+/// 边框包含图标矩形外侧像素，重绘时必须擦除背景，不能只刷新原图标。
+unsafe fn clear_system_hover(list: HWND) {
+    if list == 0 { return; }
+    RemovePropW(list,to_wide(SYSTEM_HOVER).as_ptr());
+    InvalidateRect(list,ptr::null(),1);
+}
+
+/// 使用自绘后置阶段只描图标边框，不改变单击直接添加行为。
+unsafe fn draw_system_hover(draw: &NMLVCUSTOMDRAW) -> isize {
+    if draw.nmcd.dwDrawStage == CDDS_PREPAINT { return CDRF_NOTIFYPOSTPAINT as isize; }
+    if draw.nmcd.dwDrawStage == CDDS_POSTPAINT {
+        let list = draw.nmcd.hdr.hwndFrom;
+        let row = GetPropW(list, to_wide(SYSTEM_HOVER).as_ptr()) - 1;
+        if row >= 0 && GetForegroundWindow() == GetAncestor(list,GA_ROOT) {
+            let mut rect: RECT = mem::zeroed();
+            rect.left = LVIR_ICON as i32;
+            if SendMessageW(list,LVM_GETITEMRECT,row as usize,&mut rect as *mut _ as LPARAM) != 0 {
+                rect.left-=2;rect.top-=2;rect.right+=2;rect.bottom+=2;
+                FrameRect(draw.nmcd.hdc,&rect,GetSysColorBrush(COLOR_HIGHLIGHT));
+            }
+        }
     }
+    CDRF_DODEFAULT as isize
+}
+
+unsafe extern "system" fn system_list_key(
+    hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM, _: usize, _: usize,
+) -> isize {
+    if message == WM_MOUSEMOVE {
+        let row = system_hit(hwnd, windows_sys::Win32::Foundation::POINT {
+            x:lparam as i16 as i32, y:(lparam>>16) as i16 as i32 });
+        let previous = GetPropW(hwnd,to_wide(SYSTEM_HOVER).as_ptr()) - 1;
+        if row != previous {
+            SetPropW(hwnd,to_wide(SYSTEM_HOVER).as_ptr(),row+1);
+            InvalidateRect(hwnd,ptr::null(),1);
+        }
+        let mut tracking = TRACKMOUSEEVENT { cbSize:mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags:TME_LEAVE, hwndTrack:hwnd, dwHoverTime:0 };
+        TrackMouseEvent(&mut tracking);
+    }
+    if matches!(message,WM_MOUSELEAVE | WM_KILLFOCUS)
+        || message == WM_SHOWWINDOW && wparam == 0
+        || message == WM_ENABLE && wparam == 0 {
+        clear_system_hover(hwnd);
+    }
+    if message == WM_SETCURSOR && lparam as u16 as u32 == HTCLIENT {
+        let mut point = mem::zeroed(); GetCursorPos(&mut point); ScreenToClient(hwnd,&mut point);
+        SetCursor(LoadCursorW(0,if system_hit(hwnd,point)>=0 {IDC_HAND}else{IDC_ARROW}));
+        return 1;
+    }
+    let enter = wparam as u16 == VK_RETURN;
+    if message == WM_GETDLGCODE && enter { return DLGC_WANTALLKEYS as isize; }
     if message == WM_KEYDOWN && enter {
-        let parent = GetParent(hwnd);
-        PostMessageW(
-            parent,
-            WM_COMMAND,
-            GetDlgCtrlID(hwnd) as usize | ((LBN_DBLCLK as usize) << 16),
-            hwnd as LPARAM,
-        );
+        PostMessageW(GetParent(hwnd), WM_COMMAND, IDOK as usize, 0);
         return 0;
     }
     if message == WM_NCDESTROY {
+        RemovePropW(hwnd,to_wide(SYSTEM_HOVER).as_ptr());
+        let images = SendMessageW(hwnd, LVM_GETIMAGELIST, LVSIL_SMALL as usize, 0);
+        SendMessageW(hwnd, LVM_SETIMAGELIST, LVSIL_SMALL as usize, 0);
+        if images != 0 { ImageList_Destroy(images); }
         RemoveWindowSubclass(hwnd, Some(system_list_key), 1);
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
 }
 
 unsafe fn refresh_system(hwnd: HWND, tab: usize) {
-    for (column, id) in [SYSTEM_LEFT, SYSTEM_RIGHT].into_iter().enumerate() {
-        let list = GetDlgItem(hwnd, id);
-        SendMessageW(list, LB_RESETCONTENT, 0, 0);
-        for &(title, _, _) in SYSTEM_GROUPS[tab].iter().skip(column).step_by(2) {
-            add_list_item(list, title);
-        }
+    let base = APP_STATE.with(|cell| cell.try_borrow().ok()
+        .and_then(|guard| guard.as_ref().map(|app| app.base_dir.clone()))).unwrap_or_default();
+    let list = GetDlgItem(hwnd, SYSTEM_LIST);
+    RemovePropW(list,to_wide(SYSTEM_HOVER).as_ptr());
+    SendMessageW(list, LVM_DELETEALLITEMS, 0, 0);
+    let images = ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, 16, 4);
+    let old = SendMessageW(list, LVM_SETIMAGELIST, LVSIL_SMALL as usize, images);
+    if old != 0 { ImageList_Destroy(old); }
+    for (index, &(title, target, args)) in SYSTEM_GROUPS[tab].iter().enumerate() {
+        let path = crate::system_icons::path(&base, target, args);
+        let icon = LoadImageW(0, to_wide(&path.to_string_lossy()).as_ptr(), IMAGE_ICON,
+            16, 16, LR_LOADFROMFILE);
+        let image = if icon != 0 {
+            let image = ImageList_ReplaceIcon(images, -1, icon);
+            DestroyIcon(icon);
+            image
+        } else {
+            ImageList_ReplaceIcon(images, -1, LoadIconW(0, IDI_APPLICATION))
+        };
+        let mut text = to_wide(title);
+        let mut item: LVITEMW = mem::zeroed();
+        item.mask = LVIF_TEXT | LVIF_IMAGE;
+        item.iItem = index as i32;
+        item.pszText = text.as_mut_ptr();
+        item.iImage = image;
+        SendMessageW(list, LVM_INSERTITEMW, 0, &item as *const _ as LPARAM);
     }
+    layout_system_list(hwnd);
 }
 
-unsafe fn choose_system_row(hwnd: HWND, tab: usize, id: i32) -> Option<Choice> {
-    let row = SendMessageW(GetDlgItem(hwnd, id), LB_GETCURSEL, 0, 0);
-    let index = usize::try_from(row).ok()? * 2 + usize::from(id == SYSTEM_RIGHT);
-    let &(label, target, args) = SYSTEM_GROUPS[tab].get(index)?;
-    let kind = if tab == 5 {
-        TargetKind::Launcher
-    } else {
-        TargetKind::System
-    };
-    Some(Choice {
-        label,
-        target,
-        args,
-        kind,
-    })
+const SYSTEM_CELL_WIDTH: i32 = 150;
+const SYSTEM_ROW_HEIGHT: i32 = 24;
+
+fn system_item_position(index: usize, width: i32) -> (i32, i32) {
+    let columns = ((width - 4) / SYSTEM_CELL_WIDTH).max(1) as usize;
+    (2 + (index % columns) as i32 * SYSTEM_CELL_WIDTH,
+        2 + (index / columns) as i32 * SYSTEM_ROW_HEIGHT)
+}
+
+/// 专用锚点布局，保持页签、边距和按钮大小，列表占据新增空间。
+pub unsafe fn layout_system_dialog(hwnd: HWND) -> bool {
+    let list = GetDlgItem(hwnd, SYSTEM_LIST);
+    if list == 0 { return false; }
+    let mut rect: RECT = mem::zeroed(); GetClientRect(hwnd,&mut rect);
+    let (w,h) = (rect.right,rect.bottom);
+    for (id,x,y,width,height) in [
+        (TAB,14,14,w-28,26),
+        (SYSTEM_LIST,14,42,w-28,h-110),
+        (SYSTEM_REPEAT,14,h-40,(w-114).min(240),24),
+        (IDCANCEL,w-88,h-40,73,24),
+    ] {
+        let control=GetDlgItem(hwnd,id);
+        if control != 0 {
+            SetWindowPos(control,0,x,y,width.max(1),height.max(1),SWP_NOZORDER|SWP_NOACTIVATE);
+        }
+    }
+    clear_system_hover(list);
+    layout_system_list(hwnd);
+    RedrawWindow(list,ptr::null(),0,RDW_INVALIDATE|RDW_ERASE|RDW_UPDATENOW);
+    true
+}
+
+/// 150 像素固定列距，窗口能容纳几列就显示几列，逐行排列。
+pub unsafe fn layout_system_list(hwnd: HWND) {
+    let list = GetDlgItem(hwnd, SYSTEM_LIST);
+    if list == 0 { return; }
+    let count = SendMessageW(list, LVM_GETITEMCOUNT, 0, 0).max(0) as usize;
+    // 换行可能使原生垂直滚动条出现，按最终客户区宽度再复核一次。
+    for _ in 0..2 {
+        let mut rect: RECT = mem::zeroed(); GetClientRect(list,&mut rect);
+        for index in 0..count {
+            let (x,y) = system_item_position(index,rect.right);
+            SendMessageW(list,LVM_SETITEMPOSITION,index,(x | (y << 16)) as LPARAM);
+        }
+        let mut current: RECT = mem::zeroed(); GetClientRect(list,&mut current);
+        if current.right == rect.right { break; }
+    }
+    InvalidateRect(list,ptr::null(),1);
+}
+
+unsafe fn choose_system_row(hwnd: HWND, tab: usize) -> Option<Choice> {
+    let row = SendMessageW(GetDlgItem(hwnd, SYSTEM_LIST), LVM_GETNEXTITEM,
+        usize::MAX, LVNI_SELECTED as LPARAM);
+    let &(label, target, args) = SYSTEM_GROUPS[tab].get(usize::try_from(row).ok()?)?;
+    Some(Choice { label, target, args,
+        kind: if tab == 5 { TargetKind::Launcher } else { TargetKind::System } })
+}
+
+/// 单击或回车直接添加，是否保留窗口由连续添加选项决定。
+unsafe fn activate_system(hwnd: HWND, state: &RefCell<(Dialog, (i32, i32))>) {
+    let Ok(mut guard) = state.try_borrow_mut() else { return; };
+    let Dialog::System { tab, selected, destination } = &mut guard.0 else { return; };
+    let Some(choice) = choose_system_row(hwnd, *tab) else { return; };
+    *selected = Some(choice);
+    let destination = *destination;
+    let repeat = SendMessageW(GetDlgItem(hwnd, SYSTEM_REPEAT), BM_GETCHECK, 0, 0) != 0;
+    drop(guard);
+    if let Some((category, group)) = destination {
+        if !crate::add_system_shortcut(category, group, choice) { return; }
+    }
+    if destination.is_none() || !repeat { EndDialog(hwnd, IDOK as isize); }
 }
 
 fn icons() -> &'static [Option<RgbaSurface>; 4] {
@@ -1095,7 +1207,7 @@ fn icons() -> &'static [Option<RgbaSurface>; 4] {
 
 unsafe fn draw_item(draw: &DRAWITEMSTRUCT) -> bool {
     let id = draw.CtlID as i32;
-    if !(FILE..=TEXT).contains(&id) && !matches!(id, FILTER | SYSTEM_LEFT | SYSTEM_RIGHT) {
+    if !(FILE..=TEXT).contains(&id) && id != FILTER {
         return false;
     }
     let button = (FILE..=TEXT).contains(&id);
@@ -1184,6 +1296,9 @@ unsafe extern "system" fn dialog_proc(
         EndDialog(hwnd, IDCANCEL as isize);
         return 1;
     }
+    if message == WM_ACTIVATE && wparam as u16 as u32 == WA_INACTIVE {
+        clear_system_hover(GetDlgItem(hwnd,SYSTEM_LIST));
+    }
     if !matches!(message, WM_INITDIALOG | WM_COMMAND | WM_NOTIFY) {
         return 0;
     }
@@ -1192,13 +1307,35 @@ unsafe extern "system" fn dialog_proc(
     else {
         return 0;
     };
+    if message == WM_COMMAND && wparam as u16 as i32 == IDOK {
+        let system = state.try_borrow().ok().is_some_and(|state| matches!(state.0, Dialog::System { .. }));
+        if system {
+            activate_system(hwnd, state);
+            return 1;
+        }
+    }
+    if message == WM_NOTIFY {
+        if let Some(header) = (lparam as *const NMHDR).as_ref() {
+            if header.idFrom == SYSTEM_LIST as usize && header.code == NM_CUSTOMDRAW {
+                let result = draw_system_hover(&*(lparam as *const NMLVCUSTOMDRAW));
+                SetWindowLongPtrW(hwnd,DWLP_MSGRESULT as i32,result);
+                return 1;
+            }
+            if header.idFrom == SYSTEM_LIST as usize && header.code == NM_CLICK {
+                if (*(lparam as *const NMITEMACTIVATE)).iItem >= 0 {
+                    activate_system(hwnd, state);
+                }
+                return 1;
+            }
+        }
+    }
     let Ok(mut state) = state.try_borrow_mut() else {
         return 0;
     };
     let (dialog, size) = &mut *state;
     if message == WM_INITDIALOG {
         center(hwnd, *size);
-        return match dialog {
+        let result = match dialog {
             Dialog::Manager(manager) => {
                 populate_manager(hwnd, manager);
                 1
@@ -1211,11 +1348,14 @@ unsafe extern "system" fn dialog_proc(
                 populate_text(hwnd, body);
                 0
             }
-            Dialog::System { .. } => {
-                populate_system(hwnd);
+            Dialog::System { destination, .. } => {
+                populate_system(hwnd, destination.is_some());
                 1
             }
         };
+        drop(state);
+        crate::dialog_layout::install(hwnd, false);
+        return result;
     }
     let id = wparam as u16 as i32;
     let notification = (wparam >> 16) as u16 as u32;
@@ -1246,21 +1386,7 @@ unsafe extern "system" fn dialog_proc(
             },
             Dialog::Editor(editor) => editor_command(hwnd, editor, id),
             Dialog::Text(body) => text_command(hwnd, body, id),
-            Dialog::System { tab, selected } => {
-                let id = if id == IDOK {
-                    GetDlgCtrlID(GetFocus())
-                } else {
-                    id
-                };
-                if matches!(id, SYSTEM_LEFT | SYSTEM_RIGHT)
-                    && (notification == LBN_DBLCLK || wparam as i32 == IDOK)
-                {
-                    *selected = choose_system_row(hwnd, *tab, id);
-                    if selected.is_some() {
-                        EndDialog(hwnd, IDOK as isize);
-                    }
-                }
-            }
+            Dialog::System { .. } => {}
         }
         return 1;
     }
@@ -1299,4 +1425,39 @@ unsafe extern "system" fn dialog_proc(
         _ => {}
     }
     0
+}
+
+#[cfg(test)]
+mod system_icon_tests {
+    use super::*;
+
+    #[test]
+    fn system_grid_reflows_at_fixed_150_pixel_boundaries() {
+        assert_eq!(system_item_position(1,303),(2,26));
+        assert_eq!(system_item_position(1,304),(152,2));
+        assert_eq!(system_item_position(2,453),(2,26));
+        assert_eq!(system_item_position(2,454),(302,2));
+        assert_eq!(system_item_position(3,454),(2,26));
+        assert_eq!(system_item_position(3,604),(452,2));
+        assert_eq!(system_item_position(9,604),(152,50));
+    }
+
+    #[test]
+    fn every_system_choice_has_a_decodable_icon_that_reloads_from_saved_path() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut store = crate::model::AppDataStore::default_store();
+        for group in SYSTEM_GROUPS {
+            for &(label, target, args) in *group {
+                let relative = crate::system_icons::relative_path(target, args);
+                let icon = RgbaSurface::load_file(&base.join(relative))
+                    .unwrap_or_else(|| panic!("{label} 的图标无法读取：{relative}"));
+                assert!(icon.pixels().iter().any(|pixel| pixel[3] > 0), "{label} 图标全透明");
+                store.shortcuts[0].icon_key = relative.into();
+                let tree = store.build_runtime_tree(base, &Default::default(), &Default::default());
+                let item = tree.iter().flat_map(|cat| &cat.groups).flat_map(|group| &group.items)
+                    .find(|item| item.id == store.shortcuts[0].id).unwrap();
+                assert!(item.custom_icon_16.is_some(), "{label} 保存的图标路径无法重新加载");
+            }
+        }
+    }
 }

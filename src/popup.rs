@@ -333,6 +333,12 @@ fn position(menu: ActivePopupMenu, anchor: RECT, work: RECT, (w, h): (i32, i32))
     )
 }
 
+/// 托盘指针可能位于任务栏内，必须按完整屏幕避让，不能夹到工作区边缘。
+fn pointer_position(anchor: RECT, screen: RECT, size: (i32, i32)) -> (i32, i32) {
+    let point = RECT { right: anchor.left, bottom: anchor.top, ..anchor };
+    position(ActivePopupMenu::ContextMenu { x: point.left, y: point.top }, point, screen, size)
+}
+
 pub unsafe fn sync(owner: HWND) {
     sync_with_anchor(owner, None);
 }
@@ -433,7 +439,12 @@ unsafe fn sync_with_anchor(owner: HWND, screen_anchor: Option<POINT>) {
         };
         (width, height)
     };
-    let (left, top) = position(menu, anchor, work, size);
+    // 托盘右键以鼠标为起点，只有越过工作区边缘时才翻转。
+    let (left, top) = if screen_anchor.is_some() {
+        pointer_position(anchor, info.rcMonitor, size)
+    } else {
+        position(menu, anchor, work, size)
+    };
     let class = to_wide(CLASS_NAME);
     let from_tray = screen_anchor.is_some() || matches!(menu, ActivePopupMenu::TrayStart { .. });
     let tray_only = from_tray;
@@ -751,12 +762,28 @@ mod tests {
     }
 
     #[test]
-    fn tray_main_menu_stays_above_taskbar_and_inside_work_area() {
-        let work = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
-        let anchor = RECT { left: 1880, top: 1060, right: 1881, bottom: 1061 };
-        let (x, y) = position(ActivePopupMenu::MainMenu, anchor, work, (180, 400));
-        assert!(x >= work.left && x + 180 <= work.right);
-        assert!(y >= work.top && y + 400 <= work.bottom);
+    fn tray_pointer_anchor_opens_downward_and_flips_only_at_edges() {
+        let work = RECT { left: -1920, top: 0, right: 0, bottom: 1040 };
+        let pointer = RECT { left: -800, top: 500, right: -799, bottom: 501 };
+        assert_eq!(pointer_position(pointer, work, (180, 400)), (-800, 500));
+        let edge = RECT { left: -40, top: 1030, right: -39, bottom: 1031 };
+        assert_eq!(pointer_position(edge, work, (180, 400)), (-220, 630));
+    }
+
+    #[test]
+    fn tray_menu_touches_pointer_inside_taskbar_instead_of_work_area() {
+        // 底部任务栏占据 1040..1080，菜单底边应停在鼠标 1060，而非工作区 1040。
+        let screen = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        let pointer = RECT { left: 1880, top: 1060, right: 1881, bottom: 1061 };
+        let (x, y) = pointer_position(pointer, screen, (180, 400));
+        assert_eq!((x, y), (1700, 660));
+        assert_eq!(y + 400, pointer.top);
+
+        // 左侧和顶部任务栏同样允许在指针处开始，而非跳到工作区内。
+        let left = RECT { left: 20, top: 500, right: 21, bottom: 501 };
+        assert_eq!(pointer_position(left, screen, (180, 400)), (20, 500));
+        let top = RECT { left: 800, top: 20, right: 801, bottom: 21 };
+        assert_eq!(pointer_position(top, screen, (180, 400)), (800, 20));
     }
 
     #[test]

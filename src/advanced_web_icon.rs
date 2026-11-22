@@ -14,11 +14,12 @@ use std::{
 };
 use windows_sys::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
-    WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-    WinHttpSetOption, WinHttpSetTimeouts, URL_COMPONENTS, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-    WINHTTP_FLAG_SECURE, WINHTTP_INTERNET_SCHEME_HTTP, WINHTTP_INTERNET_SCHEME_HTTPS,
-    WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
-    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+    WinHttpQueryHeaders, WinHttpQueryOption, WinHttpReadData, WinHttpReceiveResponse,
+    WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts, URL_COMPONENTS,
+    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_INTERNET_SCHEME_HTTP,
+    WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_OPTION_REDIRECT_POLICY,
+    WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
+    WINHTTP_OPTION_URL, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 
 const LIMIT: usize = 128 * 1024;
@@ -186,6 +187,14 @@ fn fetch(root: &std::path::Path, url: &str, cache: bool) -> Option<RgbaSurface> 
         }
     }
     let data = unsafe { download(&host, port, secure)? };
+    let icon = decode_icon(&data, 16)?;
+    if cache && fs::create_dir_all(dir).is_ok() {
+        let _ = icon.save_png(&path);
+    }
+    Some(icon)
+}
+
+pub(crate) fn decode_icon(data: &[u8], size: u32) -> Option<RgbaSurface> {
     let mut reader = image::ImageReader::new(Cursor::new(data))
         .with_guessed_format()
         .ok()?;
@@ -197,19 +206,72 @@ fn fetch(root: &std::path::Path, url: &str, cache: bool) -> Option<RgbaSurface> 
     let image = reader
         .decode()
         .ok()?
-        .resize_exact(16, 16, image::imageops::FilterType::Triangle)
+        .resize_exact(size, size, image::imageops::FilterType::Triangle)
         .to_rgba8();
-    let mut icon = RgbaSurface::new_empty(16, 16);
-    for (dst, src) in icon.pixels_mut().iter_mut().zip(image.pixels()) {
-        *dst = src.0;
+    Some(RgbaSurface::from_pixels(
+        size,
+        size,
+        image.pixels().map(|pixel| pixel.0).collect(),
+    ))
+}
+
+/// 元信息请求与已有图标下载共用 WinHTTP、超时和长度限制。
+pub(crate) fn download_url(url: &str, limit: usize) -> Option<(Vec<u8>, String)> {
+    unsafe {
+        let wide = to_wide(url);
+        let mut info: URL_COMPONENTS = mem::zeroed();
+        info.dwStructSize = mem::size_of::<URL_COMPONENTS>() as u32;
+        info.dwHostNameLength = u32::MAX;
+        info.dwUrlPathLength = u32::MAX;
+        info.dwExtraInfoLength = u32::MAX;
+        if WinHttpCrackUrl(wide.as_ptr(), 0, 0, &mut info) == 0
+            || info.lpszHostName.is_null()
+            || !matches!(
+                info.nScheme,
+                WINHTTP_INTERNET_SCHEME_HTTP | WINHTTP_INTERNET_SCHEME_HTTPS
+            )
+        {
+            return None;
+        }
+        let part = |pointer: *const u16, length: u32| {
+            if pointer.is_null() {
+                String::new()
+            } else {
+                String::from_utf16_lossy(std::slice::from_raw_parts(pointer, length as usize))
+            }
+        };
+        let host = part(info.lpszHostName, info.dwHostNameLength);
+        let mut path = part(info.lpszUrlPath, info.dwUrlPathLength);
+        if path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(&part(info.lpszExtraInfo, info.dwExtraInfoLength));
+        let path = path.split('#').next()?;
+        download_resource(
+            &host,
+            info.nPort,
+            info.nScheme == WINHTTP_INTERNET_SCHEME_HTTPS,
+            path,
+            limit,
+            true,
+            url,
+        )
     }
-    if cache && fs::create_dir_all(dir).is_ok() {
-        let _ = icon.save_png(&path);
-    }
-    Some(icon)
 }
 
 unsafe fn download(host: &str, port: u16, secure: bool) -> Option<Vec<u8>> {
+    download_resource(host, port, secure, "/favicon.ico", LIMIT, false, "").map(|(data, _)| data)
+}
+
+unsafe fn download_resource(
+    host: &str,
+    port: u16,
+    secure: bool,
+    path: &str,
+    limit: usize,
+    redirects: bool,
+    original: &str,
+) -> Option<(Vec<u8>, String)> {
     let session = Handle::from(WinHttpOpen(
         to_wide("KStart").as_ptr(),
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -222,13 +284,17 @@ unsafe fn download(host: &str, port: u16, secure: bool) -> Option<Vec<u8>> {
     let req = Handle::from(WinHttpOpenRequest(
         server.0,
         ptr::null(),
-        to_wide("/favicon.ico").as_ptr(),
+        to_wide(path).as_ptr(),
         ptr::null(),
         ptr::null(),
         ptr::null(),
         if secure { WINHTTP_FLAG_SECURE } else { 0 },
     ))?;
-    let policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+    let policy = if redirects {
+        WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP
+    } else {
+        WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+    };
     if WinHttpSetOption(
         req.0,
         WINHTTP_OPTION_REDIRECT_POLICY,
@@ -254,6 +320,24 @@ unsafe fn download(host: &str, port: u16, secure: bool) -> Option<Vec<u8>> {
     {
         return None;
     }
+    let mut final_url = original.to_string();
+    if redirects {
+        let mut size = 0;
+        WinHttpQueryOption(req.0, WINHTTP_OPTION_URL, ptr::null_mut(), &mut size);
+        if size > 0 && size < 32 * 1024 {
+            let mut value = vec![0u16; size as usize / 2 + 1];
+            if WinHttpQueryOption(
+                req.0,
+                WINHTTP_OPTION_URL,
+                value.as_mut_ptr().cast(),
+                &mut size,
+            ) != 0
+            {
+                let end = value.iter().position(|&ch| ch == 0).unwrap_or(value.len());
+                final_url = String::from_utf16_lossy(&value[..end]);
+            }
+        }
+    }
     let mut data = Vec::new();
     let mut buffer = [0u8; 8192];
     loop {
@@ -268,9 +352,9 @@ unsafe fn download(host: &str, port: u16, secure: bool) -> Option<Vec<u8>> {
             return None;
         }
         if count == 0 {
-            return Some(data);
+            return Some((data, final_url));
         }
-        if data.len() + count as usize > LIMIT {
+        if data.len() + count as usize > limit {
             return None;
         }
         data.extend_from_slice(&buffer[..count as usize]);

@@ -148,7 +148,9 @@ pub fn load_custom_icon_16(path: &Path) -> Option<RgbaSurface> {
         .unwrap_or_default();
     #[cfg(windows)]
     if ext == "ico" {
-        return extract_file_icon_32(path);
+        // 直接解码图标文件，避免 Shell 把 ICO 当作关联文件或提取失败。
+        return RgbaSurface::load_file(path).map(|icon| icon.resize_to(32, 32))
+            .or_else(|| extract_file_icon_32(path));
     }
     if matches!(ext.as_str(), "png" | "bmp" | "jpg" | "jpeg" | "gif" | "ico") {
         if let Some(surf) = RgbaSurface::load_file(path) {

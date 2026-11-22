@@ -485,6 +485,7 @@ pub fn format_time(pattern: &str, now: chrono::DateTime<chrono::FixedOffset>, we
     } else {
         pattern
     };
+    if pattern.contains("\\*") { return String::new(); }
     if pattern.contains('%') {
         let items: Vec<_> = chrono::format::StrftimeItems::new(pattern).collect();
         if !items
@@ -497,6 +498,13 @@ pub fn format_time(pattern: &str, now: chrono::DateTime<chrono::FixedOffset>, we
     let mut out = String::new();
     let mut remaining = pattern;
     while let Some(ch) = remaining.chars().next() {
+        if let Some(tail)=remaining.strip_prefix("\\n"){out.push('\n');remaining=tail;continue;}
+        if let Some(tail)=remaining.strip_prefix("\\b"){out.push(' ');remaining=tail;continue;}
+        if let Some(tail)=remaining.strip_prefix("ww"){out.push_str(&now.iso_week().week().to_string());remaining=tail;continue;}
+        if let Some(tail)=remaining.strip_prefix("st"){
+            let minutes=unsafe{windows_sys::Win32::System::SystemInformation::GetTickCount64()}/60000;
+            out.push_str(&format!("{}天{}小时{}分钟",minutes/1440,minutes/60%24,minutes%60));remaining=tail;continue;
+        }
         if let Some(tail) = remaining.strip_prefix("week") {
             out.push_str(weekday);
             remaining = tail;
@@ -524,6 +532,29 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
+    fn all_advanced_fields_survive_ini_round_trip() {
+        let base=std::env::temp_dir().join(format!("kstart-advanced-audit-{}",std::process::id()));
+        let mut config=crate::config::UserConfig::default();
+        for field in FIELDS.iter().flat_map(|page|page.iter()) {
+            let value=match field.kind {
+                FieldKind::Check(default)=>(!default as u8).to_string(),
+                FieldKind::Choice(options,_) => (options.len()-1).to_string(),
+                FieldKind::Number(_,max,_)=>max.to_string(),
+                FieldKind::Text(_)=>if matches!(field.key,Key::ListBackgroundColor|Key::GroupColor|Key::DefaultColor){"#123456".into()}else{"审计样本".into()},
+                FieldKind::Category=>"cat_audit".into(),FieldKind::Skin=>continue,
+            };
+            config.advanced.set(field.key,value);
+        }
+        config.advanced.fonts[1].points=13;config.advanced.spacing=[100,110,120,130,140];
+        config.try_save(&base).unwrap();let loaded=crate::config::UserConfig::load(&base);
+        for field in FIELDS.iter().flat_map(|page|page.iter()).filter(|field|field.key!=Key::Skin) {
+            assert_eq!(config.advanced.text(field.key),loaded.advanced.text(field.key),"{:?}",field.key);
+        }
+        assert_eq!(loaded.advanced.fonts[1].points,13);assert_eq!(loaded.advanced.spacing,[100,110,120,130,140]);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn missing_values_and_custom_date_tokens_are_compatible() {
         let empty: AdvancedSettings = serde_json::from_str("{}").unwrap();
         assert!(!empty.enabled(Key::AutoStart));
@@ -546,5 +577,8 @@ mod tests {
             "11月21日 星期六 09:08"
         );
         assert_eq!(format_time("%Y-%m-%d", now, "星期六"), "2026-11-21");
+        assert_eq!(format_time(r"ww\nweek\btime",now,"星期六"),"47\n星期六 09:08");
+        assert_eq!(format_time(r"\*",now,"星期六"),"");
+        assert!(format_time("st",now,"星期六").contains("小时"));
     }
 }

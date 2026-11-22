@@ -1,7 +1,7 @@
 //! 高级设置的对话框命令及系统操作。
 
 use crate::{
-    advanced::{self, color, AdvancedSettings, Key},
+    advanced::{self, AdvancedSettings, Key},
     advanced_dialog as dialog, apply_hrgn_safely, close_modal_window,
     native_dialogs::set_ctrl_text,
     pick_file_dialog, pick_folder_dialog, to_wide, ActiveModal, APP_STATE,
@@ -9,7 +9,7 @@ use crate::{
 use std::{
     fs,
     hash::{DefaultHasher, Hash, Hasher},
-    io, mem,
+    io,
     path::{Path, PathBuf},
     ptr,
 };
@@ -25,9 +25,6 @@ use windows_sys::Win32::System::Registry::{
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessWorkingSetSize, SetPriorityClass, ABOVE_NORMAL_PRIORITY_CLASS,
     BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
-};
-use windows_sys::Win32::UI::Controls::Dialogs::{
-    ChooseColorW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK,
@@ -109,13 +106,20 @@ pub unsafe fn command(hwnd: HWND, id: i32, notification: u32) -> bool {
         dialog::show_page(hwnd);
         return true;
     }
+    if dialog::color_field(id).is_some() {
+        let initial=crate::native_dialogs::get_ctrl_text(hwnd,id);
+        let value=crate::color_picker::choose_value(hwnd,windows_sys::Win32::UI::WindowsAndMessaging::GetDlgItem(hwnd,id),&initial);
+        if let Some(value)=value{set_ctrl_text(hwnd,id,&value);InvalidateRect(windows_sys::Win32::UI::WindowsAndMessaging::GetDlgItem(hwnd,id),ptr::null(),1);}
+        return true;
+    }
     if let Some((edit, key)) = dialog::picker(id) {
+        if key==Key::TimeFormat { message(hwnd,dialog::TIME_FORMAT_HELP);return true; }
         if matches!(
             key,
             Key::ListBackgroundColor | Key::GroupColor | Key::DefaultColor
         ) {
             let initial = crate::native_dialogs::get_ctrl_text(hwnd, edit);
-            if let Some(value) = pick_color(hwnd, &initial) {
+            if let Some(value) = crate::color_picker::choose_value(hwnd,windows_sys::Win32::UI::WindowsAndMessaging::GetDlgItem(hwnd,edit),&initial) {
                 set_ctrl_text(hwnd, edit, &value);
             }
         } else {
@@ -236,20 +240,6 @@ fn set_spacing(spacing: [u32; 5]) {
     });
 }
 
-unsafe fn pick_color(owner: HWND, initial: &str) -> Option<String> {
-    let mut picker: CHOOSECOLORW = mem::zeroed();
-    let mut palette = [0x00ffffff; 16];
-    picker.lStructSize = mem::size_of::<CHOOSECOLORW>() as u32;
-    picker.hwndOwner = owner;
-    picker.lpCustColors = palette.as_mut_ptr();
-    picker.rgbResult = color(initial).map_or(0, |c| c.to_colorref());
-    picker.Flags = CC_FULLOPEN | CC_RGBINIT;
-    (ChooseColorW(&mut picker) != 0).then(|| {
-        let [r, g, b, _] = picker.rgbResult.to_le_bytes();
-        format!("#{r:02X}{g:02X}{b:02X}")
-    })
-}
-
 unsafe fn edit_fonts(
     owner: HWND,
     fonts: &[advanced::FontSetting; 4],
@@ -340,6 +330,9 @@ unsafe fn apply(
     skin: usize,
     previous: &AdvancedSettings,
 ) -> Result<(), String> {
+    if !settings.text(Key::ListBackground).is_empty() && crate::load_list_background(base,&settings).is_none() {
+        return Err("列表背景图片无法读取，请重新选择图片。".into());
+    }
     settings.launch_counts = previous.launch_counts.clone();
     let (mut next_config, selected) = APP_STATE
         .with(|cell| {
@@ -494,7 +487,7 @@ fn restore(owner: HWND, base: &Path, source: &Path) -> io::Result<()> {
     }
     let config = crate::config::UserConfig::load(base);
     let hotkey = crate::config::HotkeyConfig::load(base);
-    crate::hotkeys::changed(owner);
+    if owner != 0 { crate::hotkeys::changed(owner); }
     let region = APP_STATE.with(|cell| {
         let mut guard = cell.try_borrow_mut().ok()?;
         let app = guard.as_mut()?;
@@ -514,10 +507,10 @@ fn restore(owner: HWND, base: &Path, source: &Path) -> io::Result<()> {
     if let Some(region) = region {
         apply_hrgn_safely(owner, region);
     }
-    unsafe {
+    if owner != 0 { unsafe {
         crate::advanced_window::apply_opacity(owner);
         InvalidateRect(owner, ptr::null(), 0);
-    }
+    }}
     Ok(())
 }
 
@@ -688,4 +681,31 @@ fn cached_file_icon(
         let _ = image.save_png(&cache);
     }
     Some(image)
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[test]
+    fn backup_restore_preserves_credentials_and_cache_clear_preserves_user_icons() {
+        let base=std::env::temp_dir().join(format!("kstart-backup-audit-{}",std::process::id()));
+        let mut config=crate::config::UserConfig::default();
+        config.advanced.set(Key::DefaultColor,"#123456".into());
+        let credentials=crate::config::Verification{login:"original-login".into(),lock:"original-lock".into()};
+        config.save_to(&base.join("user"),&Default::default(),&credentials).unwrap();
+        let data=crate::model::AppDataStore::default_store();data.save(&base);
+        fs::create_dir_all(base.join("user/icons")).unwrap();fs::create_dir_all(base.join("user/icon-cache")).unwrap();
+        fs::write(base.join("user/icons/chosen.png"),b"chosen").unwrap();fs::write(base.join("user/icon-cache/derived.png"),b"cache").unwrap();
+        let export=base.join("export");backup(&base,&export).unwrap();
+        assert!(crate::config::Verification::load(&export).login.is_empty());
+        config.advanced.set(Key::DefaultColor,"#FFFFFF".into());
+        let current=crate::config::Verification{login:"current-login".into(),lock:"current-lock".into()};
+        config.save_to(&base.join("user"),&Default::default(),&current).unwrap();
+        restore(0,&base,&export).unwrap();
+        assert_eq!(crate::config::UserConfig::load(&base).advanced.text(Key::DefaultColor),"#123456");
+        assert_eq!(crate::config::Verification::load(&base.join("user")).login,"current-login");
+        clear_icon_cache(&base).unwrap();
+        assert!(!base.join("user/icon-cache/derived.png").exists());assert!(base.join("user/icons/chosen.png").exists());
+        fs::remove_dir_all(base).unwrap();
+    }
 }

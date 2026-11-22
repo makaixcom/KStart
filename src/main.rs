@@ -8,19 +8,24 @@
 
 mod advanced;
 mod advanced_dialog;
+mod color_picker;
 mod advanced_runtime;
 mod advanced_prompt;
 mod advanced_shell;
 mod advanced_style;
 mod advanced_system;
 mod advanced_web_icon;
+mod web_metadata;
+mod web_link_dialog;
 mod advanced_window;
 mod hotkey_dialog;
 mod hotkeys;
+mod system_icons;
 mod targets;
 mod config;
 mod model;
 mod native_dialogs;
+mod dialog_layout;
 mod popup;
 mod renderer;
 mod search;
@@ -46,7 +51,6 @@ use renderer::{
     normalize_rect, rects_intersect, render_main_frame, render_modal_window_frame, ActiveModal,
     ActivePopupMenu, EditShortcutDialogState, EditShortcutField, HitTarget,
     ModalRenderContext, RenderState,
-    STANDARD_PALETTE,
 };
 use search::{matching_shortcuts, split_run_input, SearchDialogState, SearchMode, SearchResultRow};
 use skin_assets::{extract_file_icon_32, load_custom_icon_16, BuiltinIcons, Canvas, SkinAssets};
@@ -62,7 +66,7 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CombineRgn, CreateFontW, CreateRectRgn, CreateSolidBrush, DeleteObject, EndPaint,
+    BeginPaint, CombineRgn, CreateFontW, CreateRectRgn, DeleteObject, EndPaint,
     FillRect, InvalidateRect, RedrawWindow, ScreenToClient,
     SetWindowRgn, COLOR_BTNFACE, DEFAULT_QUALITY, FW_NORMAL, GB2312_CHARSET, HBRUSH, HDC,
     HFONT, HRGN, OUT_DEFAULT_PRECIS, PAINTSTRUCT, RDW_INVALIDATE, RDW_NOERASE, RDW_UPDATENOW,
@@ -430,6 +434,7 @@ impl AppState {
             } else { item.icon_key.clone() },
             pending_icon_16: item.custom_icon_16.clone(),
             text_color: item.text_color,
+            use_default_color: item.use_default_color,
             args: item.args.clone(),
             work_dir: item.work_dir.clone(),
             hotkey: hk,
@@ -456,7 +461,7 @@ impl AppState {
         } else {
             fallback_icon_key.to_string()
         };
-        ActiveModal::EditShortcut(EditShortcutDialogState {
+        ActiveModal::EditShortcut(EditShortcutDialogState { use_default_color: true,
             target_kind_hint: None,
             is_new: true,
             shortcut_id: new_id,
@@ -525,7 +530,7 @@ impl AppState {
         let cat_id = cat.id.clone();
         let col_id = cat.groups[grp_idx].id.clone();
 
-        cat.groups[grp_idx].items.push(ShortcutItem {
+        cat.groups[grp_idx].items.push(ShortcutItem { use_default_color: true,
             id: new_id,
             category_id: cat_id,
             column_id: col_id,
@@ -690,6 +695,7 @@ fn show_centered_modal(modal: ActiveModal) {
             }
         });
         if hwnd != 0 {
+            dialog_layout::install(hwnd, !use_native);
             ShowWindow(hwnd, SW_SHOWNORMAL);
             SetForegroundWindow(hwnd);
             if is_search {
@@ -697,6 +703,77 @@ fn show_centered_modal(modal: ActiveModal) {
             }
             InvalidateRect(hwnd, ptr::null(), 0);
         }
+    }
+}
+
+/// 点击系统功能即写入当前栏目，图标来源相对于数据根目录保存。
+fn add_system_shortcut(category: usize, group: usize, choice: hotkey_dialog::Choice) -> bool {
+    let added = APP_STATE.with(|cell| {
+        let mut guard = cell.try_borrow_mut().ok()?;
+        let app = guard.as_mut()?;
+        let id = app.data_store.next_shortcut_id();
+        let icon_key = system_icons::relative_path(choice.target, choice.args).to_string();
+        let custom_icon_16 = skin_assets::RgbaSurface::load_file(&app.base_dir.join(&icon_key));
+        let text_color = advanced::color(app.user_cfg.advanced.text(Setting::DefaultColor))
+            .unwrap_or(RgbColor::new(0, 0, 0));
+        let category = app.categories.get_mut(category)?;
+        let column = category.groups.get_mut(group)?;
+        column.items.push(ShortcutItem { use_default_color: true,
+            id, category_id: category.id.clone(), column_id: column.id.clone(),
+            name: choice.label.into(), target_path: choice.target.into(), target_kind: choice.kind,
+            icon_key, custom_icon_16, text_color, args: choice.args.into(),
+            work_dir: String::new(), remark: String::new(), minimize_on_run: false,
+        });
+        app.persist_data();
+        Some(app.main_hwnd)
+    });
+    if let Some(hwnd) = added {
+        unsafe { InvalidateRect(hwnd, ptr::null(), 0); }
+        true
+    } else { false }
+}
+
+/// 网站图标作为用户选定资源保存，缓存清理和重启均不会丢失。
+fn add_web_shortcut(category: usize, group: usize, draft: web_link_dialog::Draft) {
+    let saved = APP_STATE.with(|cell| {
+        let mut guard = cell.try_borrow_mut().ok()?;
+        let app = guard.as_mut()?;
+        app.categories.get(category)?.groups.get(group)?;
+        let id = app.data_store.next_shortcut_id();
+        let icon_key = if draft.custom_icon {
+            let path = format!("user/icons/{id}.png");
+            let dir = app.base_dir.join("user/icons");
+            if fs::create_dir_all(dir).is_err() || !draft.icon.as_ref()?.save_png(&app.base_dir.join(&path)) { return None; }
+            path
+        } else { "icons/url.ico".into() };
+        let text_color = advanced::color(app.user_cfg.advanced.text(Setting::DefaultColor)).unwrap_or(RgbColor::new(0,0,0));
+        let category = app.categories.get_mut(category)?;
+        let column = category.groups.get_mut(group)?;
+        column.items.push(ShortcutItem { use_default_color: true, id, category_id:category.id.clone(), column_id:column.id.clone(),
+            name:draft.name, target_path:draft.url, target_kind:targets::TargetKind::Web,
+            icon_key, custom_icon_16:draft.icon, text_color, args:String::new(), work_dir:String::new(),
+            remark:String::new(), minimize_on_run:false });
+        app.persist_data();Some(app.main_hwnd)
+    });
+    if let Some(hwnd)=saved { unsafe { InvalidateRect(hwnd,ptr::null(),0); } }
+}
+
+unsafe fn pick_shortcut_color(hwnd: HWND) {
+    let initial=APP_STATE.with(|cell|{
+        let guard=cell.try_borrow().ok()?;let app=guard.as_ref()?;
+        let ActiveModal::EditShortcut(editor)=&app.modal else{return None;};
+        Some(if editor.use_default_color{String::new()}else{model::format_hex_color(editor.text_color)})
+    });
+    let Some(initial)=initial else{return;};
+    let control=GetDlgItem(hwnd,native_dialogs::ID_EDIT_COLOR_BASE);
+    if let Some(value)=color_picker::choose_value(hwnd,if control==0{hwnd}else{control},&initial) {
+        if control!=0 {native_dialogs::set_ctrl_text(hwnd,native_dialogs::ID_EDIT_COLOR_BASE,&value);}
+        APP_STATE.with(|cell|{if let Ok(mut guard)=cell.try_borrow_mut(){
+            if let Some(app)=guard.as_mut(){if let ActiveModal::EditShortcut(editor)=&mut app.modal {
+                editor.use_default_color=value.is_empty();editor.text_color=advanced::color(&value).unwrap_or(RgbColor::new(0,0,0));
+            }}
+        }});
+        InvalidateRect(hwnd,ptr::null(),1);
     }
 }
 
@@ -919,8 +996,7 @@ fn launch_typed_target(
         }
         System => {
             if let Some(name) = target.strip_prefix("kstart:") {
-                advanced_system::execute(hwnd, name, settings);
-                true
+                advanced_system::execute(hwnd, name, settings)
             } else {
                 launch_target_url_or_path(target, args, work_dir, hwnd)
             }
@@ -962,7 +1038,15 @@ fn launch_shortcut(item: &ShortcutItem, hwnd: HWND) {
         }
         return;
     }
-    if matches!(item.target_kind, targets::TargetKind::System | targets::TargetKind::Launcher) { return; }
+    // 点击仅在启动前临时选中；成功后清除高亮，系统功能也必须经过此处。
+    APP_STATE.with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            if let Some(app) = guard.as_mut() {
+                app.selected_shortcuts.clear();
+            }
+        }
+    });
+    unsafe { InvalidateRect(hwnd, ptr::null(), 0); }
     if is_url && settings.enabled(Setting::WebIcons) && item.custom_icon_16.is_none() {
         advanced_web_icon::fetch_for_shortcut(base.clone(), target.clone(), settings.enabled(Setting::CacheWebIcons));
     }
@@ -983,6 +1067,7 @@ fn launch_shortcut(item: &ShortcutItem, hwnd: HWND) {
     if settings.enabled(Setting::Sound) {
         unsafe { windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(MB_OK); }
     }
+    if matches!(item.target_kind, targets::TargetKind::System | targets::TargetKind::Launcher) { return; }
     if hwnd != 0 {
         unsafe {
             advanced_window::hide_after_launch(hwnd, settings.number(Setting::AfterLaunch),
@@ -1259,10 +1344,12 @@ enum DeferredDialogRequest {
     ContextAddFile(usize, usize),
     ContextAddDir(usize, usize),
     ContextSystemAction(usize, usize),
+    ContextHyperlink(usize, usize),
+    ClearColumn(usize, usize),
     EditPickFile,
     EditPickDir,
     EditPickIcon,
-    AboutCheckUpdate,
+    EditPickColor,
     CategoryPickIcon(usize),
     CategoryAddIcon(usize),
     CategoryManageIcons,
@@ -1294,18 +1381,7 @@ fn handle_context_menu_action(
         ContextMenuAction::AddDirectory => {
             (None, DeferredDialogRequest::ContextAddDir(cat_idx, grp_idx))
         }
-        ContextMenuAction::AddHyperlink => (
-            Some(app.make_new_shortcut_modal(
-                cat_idx,
-                grp_idx,
-                "新建网址".to_string(),
-                "https://".to_string(),
-                String::new(),
-                None,
-                "ctx_add_url",
-            )),
-            DeferredDialogRequest::None,
-        ),
+        ContextMenuAction::AddHyperlink => (None, DeferredDialogRequest::ContextHyperlink(cat_idx, grp_idx)),
         ContextMenuAction::AddSystemFunc => (
             None, DeferredDialogRequest::ContextSystemAction(cat_idx, grp_idx),
         ),
@@ -1360,25 +1436,7 @@ fn handle_context_menu_action(
             }
             (None, DeferredDialogRequest::None)
         }
-        ContextMenuAction::ClearColumn => {
-            if let Some(cat) = app.categories.get_mut(cat_idx) {
-                if let Some(grp) = cat.groups.get_mut(grp_idx) {
-                    grp.items.clear();
-                    app.selected_shortcuts.clear();
-                    app.persist_data();
-                }
-            }
-            (None, DeferredDialogRequest::None)
-        }
-        ContextMenuAction::EncryptColumn => {
-            if let Some(cat) = app.categories.get_mut(cat_idx) {
-                if let Some(grp) = cat.groups.get_mut(grp_idx) {
-                    grp.encrypted = !grp.encrypted;
-                    app.persist_data();
-                }
-            }
-            (None, DeferredDialogRequest::None)
-        }
+        ContextMenuAction::ClearColumn => (None, DeferredDialogRequest::ClearColumn(cat_idx, grp_idx)),
         ContextMenuAction::RenameColumnTitle => {
             if let Some(cat) = app.categories.get_mut(cat_idx) {
                 let next_num = cat.groups.len() + 1;
@@ -1574,13 +1632,12 @@ unsafe fn apply_cursor_for_hit(target: HitTarget) {
         | HitTarget::EditScPickFile
         | HitTarget::EditScPickDir
         | HitTarget::EditScPickIcon
-        | HitTarget::EditScColorPalette(_)
+        | HitTarget::EditScPickColor
         | HitTarget::EditScToggleMinOnRun
         | HitTarget::EditScOk
         | HitTarget::EditScCancel
         | HitTarget::AboutLink(_)
         | HitTarget::AboutSupportLink
-        | HitTarget::AboutCheckUpdate
         | HitTarget::AboutClose => IDC_HAND,
         HitTarget::SearchBox
         | HitTarget::EditScField(_) => IDC_IBEAM,
@@ -2523,20 +2580,36 @@ unsafe extern "system" fn main_wnd_proc(
 
             // 在 RefCell 借用完全释放后再弹出文件/目录选择框，防止重入崩溃
             match deferred_req {
-                DeferredDialogRequest::ContextSystemAction(cat_idx, grp_idx) => {
-                    if let Some(choice) = hotkey_dialog::choose_system(hwnd) {
-                        modal_to_open = APP_STATE.with(|cell| {
-                            let guard = cell.try_borrow().ok()?;
-                            let app = guard.as_ref()?;
-                            let mut modal = app.make_new_shortcut_modal(cat_idx, grp_idx, choice.label.into(),
-                                choice.target.into(), String::new(), None, "ctx_add_sys");
-                            if let ActiveModal::EditShortcut(editor) = &mut modal {
-                                editor.args = choice.args.into();
-                                editor.target_kind_hint = Some(choice.kind);
-                            }
-                            Some(modal)
-                        });
+                DeferredDialogRequest::ClearColumn(category, group) => {
+                    let snapshot = APP_STATE.with(|cell| {
+                        let guard = cell.try_borrow().ok()?; let app = guard.as_ref()?;
+                        let column = app.categories.get(category)?.groups.get(group)?;
+                        Some((column.id.clone(), column.title.clone(),column.items.len()))
+                    });
+                    if let Some((id,title,count)) = snapshot {
+                        if count > 0 && advanced_runtime::confirm(hwnd,&format!("确定清空栏目“{title}”中的全部 {count} 个快捷方式吗？\n此操作不可撤销，只移除 KStart 条目，不删除原文件。")) {
+                            APP_STATE.with(|cell| { if let Ok(mut guard)=cell.try_borrow_mut() {
+                                if let Some(app)=guard.as_mut() {
+                                    if let Some(column)=app.categories.get_mut(category).and_then(|cat|cat.groups.get_mut(group)).filter(|column|column.id==id) {
+                                        column.items.clear(); app.selected_shortcuts.clear(); app.persist_data();
+                                    }
+                                }
+                            }});
+                            InvalidateRect(hwnd,ptr::null(),0);
+                        }
                     }
+                }
+                DeferredDialogRequest::ContextHyperlink(category, group) => {
+                    let base = APP_STATE.with(|cell| cell.try_borrow().ok()
+                        .and_then(|guard|guard.as_ref().map(|app|app.base_dir.clone())));
+                    if let Some(base) = base {
+                        if let Some(draft) = web_link_dialog::show(hwnd, base) {
+                            add_web_shortcut(category, group, draft);
+                        }
+                    }
+                }
+                DeferredDialogRequest::ContextSystemAction(cat_idx, grp_idx) => {
+                    hotkey_dialog::add_system_shortcuts(hwnd, cat_idx, grp_idx);
                 }
                 DeferredDialogRequest::ContextAddFile(cat_idx, grp_idx) => {
                     if let Some(picked) = pick_file_dialog(
@@ -2840,6 +2913,11 @@ unsafe extern "system" fn modal_wnd_proc(
     if GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_CAPTION == WS_CAPTION {
         return native_modal_wnd_proc(hwnd, msg, wparam, lparam);
     }
+    let lparam = if matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
+        let base = APP_STATE.with(|cell| cell.try_borrow().ok()
+            .and_then(|guard| guard.as_ref().map(|app| app.modal.window_size()))).unwrap_or((1,1));
+        dialog_layout::logical_mouse(hwnd, lparam, base)
+    } else { lparam };
     match msg {
         WM_ERASEBKGND => 1,
 
@@ -3144,13 +3222,7 @@ unsafe extern "system" fn modal_wnd_proc(
                             HitTarget::EditScPickIcon => {
                                 deferred_req = DeferredDialogRequest::EditPickIcon;
                             }
-                            HitTarget::EditScColorPalette(c_idx) => {
-                                if let ActiveModal::EditShortcut(ed) = &mut app.modal {
-                                    if let Some(&col) = STANDARD_PALETTE.get(c_idx) {
-                                        ed.text_color = col;
-                                    }
-                                }
-                            }
+                            HitTarget::EditScPickColor => { deferred_req=DeferredDialogRequest::EditPickColor; }
                             HitTarget::EditScToggleMinOnRun => {
                                 if let ActiveModal::EditShortcut(ed) = &mut app.modal {
                                     ed.minimize_on_run = !ed.minimize_on_run;
@@ -3179,7 +3251,7 @@ unsafe extern "system" fn modal_wnd_proc(
                                             let cat_id = cat.id.clone();
                                             if let Some(grp) = cat.groups.get_mut(ed.grp_idx) {
                                                 let col_id = grp.id.clone();
-                                                grp.items.push(ShortcutItem {
+                                                grp.items.push(ShortcutItem { use_default_color: ed.use_default_color,
                                                     id: ed.shortcut_id.clone(),
                                                     category_id: cat_id,
                                                     column_id: col_id,
@@ -3208,6 +3280,7 @@ unsafe extern "system" fn modal_wnd_proc(
                                                 item.target_path = ed.target_path;
                                                 item.icon_key = ed.icon_key;
                                                 item.text_color = ed.text_color;
+                                                item.use_default_color = ed.use_default_color;
                                                 item.args = ed.args;
                                                 item.work_dir = ed.work_dir;
                                                 item.remark = ed.remark;
@@ -3244,9 +3317,6 @@ unsafe extern "system" fn modal_wnd_proc(
                                     hwnd,
                                 );
                             }
-                            HitTarget::AboutCheckUpdate => {
-                                deferred_req = DeferredDialogRequest::AboutCheckUpdate;
-                            }
                             _ => {}
                         }
                     }
@@ -3259,6 +3329,7 @@ unsafe extern "system" fn modal_wnd_proc(
 
             // 在 RefCell 借用释放后安全弹出原生选择框 / 提示框
             match deferred_req {
+                DeferredDialogRequest::EditPickColor => pick_shortcut_color(hwnd),
                 DeferredDialogRequest::EditPickFile => {
                     if let Some(picked) =
                         pick_file_dialog(hwnd, "选择目标文件或程序", &[("所有文件 (*.*)", "*.*")])
@@ -3344,11 +3415,6 @@ unsafe extern "system" fn modal_wnd_proc(
                             });
                         }
                     }
-                }
-                DeferredDialogRequest::AboutCheckUpdate => {
-                    let m = to_wide("当前版本 5.1 Build 2012.8.20 已是最新复刻版！");
-                    let t = to_wide("检查升级");
-                    MessageBoxW(hwnd, m.as_ptr(), t.as_ptr(), MB_OK | MB_ICONINFORMATION);
                 }
                 _ => {}
             }
@@ -3509,7 +3575,9 @@ unsafe extern "system" fn modal_wnd_proc(
                             hover_target: app.modal_hover_target,
                         };
                         let texts = render_modal_window_frame(&ctx, &mut app.modal_canvas);
+                        let saved = dialog_layout::begin_paint_scale(hwnd, hdc, app.modal.window_size());
                         let _ = blit_canvas_with_gdi_texts(&app.modal_canvas, &texts, None, hdc, false, None);
+                        windows_sys::Win32::Graphics::Gdi::RestoreDC(hdc, saved);
                     }
                 }
             });
@@ -3604,6 +3672,10 @@ unsafe extern "system" fn native_modal_wnd_proc(
             if !dis.is_null() {
                 let d = &*dis;
                 let cid = d.CtlID as i32;
+                if advanced_dialog::draw_picker_icon(d) {return 1;}
+                if advanced_dialog::color_field(cid).is_some() {
+                    color_picker::draw_button(d);return 1;
+                }
                 let category_drawn = APP_STATE.with(|cell| {
                     let Ok(guard) = cell.try_borrow() else { return false; };
                     let Some(app) = guard.as_ref() else { return false; };
@@ -3646,16 +3718,8 @@ unsafe extern "system" fn native_modal_wnd_proc(
                     });
                     return 1;
                 }
-                if (native_dialogs::ID_EDIT_COLOR_BASE..native_dialogs::ID_EDIT_COLOR_BASE + 8)
-                    .contains(&cid)
-                {
-                    let c = native_dialogs::palette_color((cid - native_dialogs::ID_EDIT_COLOR_BASE) as usize);
-                    let brush: HBRUSH = CreateSolidBrush(c.to_colorref());
-                    if brush != 0 {
-                        FillRect(d.hDC, &d.rcItem, brush);
-                        DeleteObject(brush as _);
-                    }
-                    return 1;
+                if cid == native_dialogs::ID_EDIT_COLOR_BASE {
+                    color_picker::draw_button(d);return 1;
                 }
             }
             0
@@ -3665,7 +3729,9 @@ unsafe extern "system" fn native_modal_wnd_proc(
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             let hdc = BeginPaint(hwnd, &mut ps);
             if is_advanced() {
+                let saved = dialog_layout::begin_paint_scale(hwnd, hdc, (advanced_dialog::WIDTH, advanced_dialog::HEIGHT));
                 advanced_dialog::paint(hwnd, hdc, GetWindowLongPtrW(hwnd, GWLP_USERDATA) as HFONT);
+                windows_sys::Win32::Graphics::Gdi::RestoreDC(hdc, saved);
                 EndPaint(hwnd, &ps);
                 return 0;
             }
@@ -3675,7 +3741,11 @@ unsafe extern "system" fn native_modal_wnd_proc(
             APP_STATE.with(|cell| {
                 if let Ok(guard) = cell.try_borrow() {
                     if let Some(app) = guard.as_ref() {
+                        let base = native_dialogs::native_modal_client_info(&app.modal);
+                        let saved = if matches!(app.modal, ActiveModal::SkinManager) { 0 }
+                            else { dialog_layout::begin_paint_scale(hwnd, hdc, (base.0.max(1),base.1.max(1))) };
                         native_dialogs::paint_native_modal_extras(hwnd, hdc, app);
+                        if saved != 0 { windows_sys::Win32::Graphics::Gdi::RestoreDC(hdc, saved); }
                     }
                 }
             });
@@ -3953,13 +4023,8 @@ unsafe extern "system" fn native_modal_wnd_proc(
                                     deferred = DeferredDialogRequest::EditPickDir;
                                 } else if ctrl_id == native_dialogs::ID_EDIT_PICK_ICON {
                                     deferred = DeferredDialogRequest::EditPickIcon;
-                                } else if (native_dialogs::ID_EDIT_COLOR_BASE
-                                    ..native_dialogs::ID_EDIT_COLOR_BASE + 8)
-                                    .contains(&ctrl_id)
-                                {
-                                    let idx = (ctrl_id - native_dialogs::ID_EDIT_COLOR_BASE) as usize;
-                                    ed.text_color = native_dialogs::palette_color(idx);
-                                    InvalidateRect(hwnd, ptr::null(), 1);
+                                } else if ctrl_id == native_dialogs::ID_EDIT_COLOR_BASE {
+                                    deferred=DeferredDialogRequest::EditPickColor;
                                 }
                             }
 
@@ -3982,6 +4047,7 @@ unsafe extern "system" fn native_modal_wnd_proc(
                 DeferredDialogRequest::CategoryPickIcon(index) => category_dialog::pick(hwnd, index),
                 DeferredDialogRequest::CategoryAddIcon(index) => category_dialog::add(hwnd, index),
                 DeferredDialogRequest::CategoryManageIcons => category_dialog::manage(hwnd),
+                DeferredDialogRequest::EditPickColor => pick_shortcut_color(hwnd),
                 DeferredDialogRequest::EditPickFile => {
                     if let Some(picked) = pick_file_dialog(
                         hwnd,

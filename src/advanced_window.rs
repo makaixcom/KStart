@@ -371,6 +371,20 @@ pub unsafe fn activate_main(hwnd: HWND) {
         }
     }});
     sync_list_visibility(hwnd);
+    let center = APP_STATE.with(|cell| cell.try_borrow().ok().is_some_and(|guard|
+        guard.as_ref().is_some_and(|app|app.user_cfg.advanced.enabled(Key::CenterPointer))));
+    if center {
+        let mut cursor: POINT = mem::zeroed(); GetCursorPos(&mut cursor);
+        let mut rect: RECT = mem::zeroed(); GetWindowRect(hwnd,&mut rect);
+        let anchor=RECT{left:cursor.x,top:cursor.y,right:cursor.x+1,bottom:cursor.y+1};
+        let mut monitor:MONITORINFO=mem::zeroed();monitor.cbSize=mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(MonitorFromRect(&anchor,MONITOR_DEFAULTTONEAREST),&mut monitor)!=0 {
+            let work=monitor.rcWork;let (w,h)=(rect.right-rect.left,rect.bottom-rect.top);
+            let x=(cursor.x-w/2).clamp(work.left,(work.right-w).max(work.left));
+            let y=(cursor.y-h/2).clamp(work.top,(work.bottom-h).max(work.top));
+            SetWindowPos(hwnd,0,x,y,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+        }
+    }
     SetForegroundWindow(hwnd);
 }
 
@@ -726,7 +740,7 @@ pub unsafe fn tick(hwnd: HWND) {
         } else {
             VK_MBUTTON
         };
-        let pressed_now = settings.enabled(Key::MiddleToggle) && pressed(button);
+        let pressed_now = (settings.enabled(Key::MiddleToggle) || settings.enabled(Key::RightToggle)) && pressed(button);
         if pressed_now
             && !state.button_pressed
             && !state.resolution_hidden

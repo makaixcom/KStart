@@ -4,16 +4,15 @@
 //! 天然支持键盘上下键切换、原生滚动条、Tab 焦点流转及系统中文输入法 (IME)。
 
 use crate::model::{CategoryTab, ShortcutItem};
-use crate::renderer::{ActiveModal, EditShortcutDialogState, STANDARD_PALETTE};
+use crate::renderer::{ActiveModal, EditShortcutDialogState};
 use crate::skin_assets::RgbaSurface;
-use crate::skin_parser::RgbColor;
 use crate::{to_wide, AppState};
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateSolidBrush, FillRect, InvalidateRect, SetBkMode, SetDIBitsToDevice,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBRUSH, HDC, HFONT,
+    FillRect, InvalidateRect, SetBkMode, SetDIBitsToDevice,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, HFONT,
     TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -75,7 +74,7 @@ pub const ID_EDIT_LBL_HK: i32 = 1415;
 pub const ID_EDIT_HK: i32 = 1416;
 pub const ID_EDIT_CHK_MIN: i32 = 1417;
 pub const ID_EDIT_REMARK: i32 = 1418;
-pub const ID_EDIT_COLOR_BASE: i32 = 1450; // 1450..1457 共 8 个色块按钮
+pub const ID_EDIT_COLOR_BASE: i32 = 1450; // 统一文字颜色选择器
 
 /// 弹窗客户区基础宽高 `(width, height)` 与标题
 pub fn native_modal_client_info(modal: &ActiveModal) -> (i32, i32, &'static str) {
@@ -447,21 +446,9 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
             );
 
             create_ctrl(hwnd, hfont, "STATIC", "颜色:", 0, 0, 22, 184, 42, 18, ID_EDIT_LBL_COLOR);
-            for idx in 0..8 {
-                create_ctrl(
-                    hwnd,
-                    hfont,
-                    "BUTTON",
-                    "",
-                    0,
-                    WS_TABSTOP | (BS_OWNERDRAW as u32),
-                    150 + (idx as i32) * 26,
-                    181,
-                    22,
-                    22,
-                    ID_EDIT_COLOR_BASE + idx as i32,
-                );
-            }
+            let color=if ed.use_default_color {String::new()} else {crate::model::format_hex_color(ed.text_color)};
+            create_ctrl(hwnd,hfont,"BUTTON",&color,0,WS_TABSTOP|BS_OWNERDRAW as u32,
+                68,181,288,22,ID_EDIT_COLOR_BASE);
 
             create_ctrl(hwnd, hfont, "STATIC", "参数:", 0, 0, 22, 218, 42, 18, ID_EDIT_LBL_ARGS);
             create_ctrl(
@@ -653,6 +640,9 @@ pub(crate) unsafe fn blit_surface_on_bg(
     if surf.width == 0 || surf.height == 0 || dst_w <= 0 || dst_h <= 0 {
         return;
     }
+    // SetDIBitsToDevice 只复制像素，不会缩放；先匹配目标尺寸，避免小图标被裁切。
+    let scaled = surf.resize_to(dst_w as u32, dst_h as u32);
+    let surf = &scaled;
     let mut bgra = Vec::with_capacity((surf.width * surf.height) as usize);
     for p in surf.pixels() {
         let a = p[3] as u32;
@@ -695,7 +685,7 @@ pub(crate) unsafe fn blit_surface_on_bg(
 }
 
 /// 绘制原生弹窗中的图像预览与色块（如皮肤缩略图、分类图标、快捷方式图标及 8 色调色板）
-pub unsafe fn paint_native_modal_extras(_hwnd: HWND, hdc: HDC, app: &AppState) {
+pub unsafe fn paint_native_modal_extras(hwnd: HWND, hdc: HDC, app: &AppState) {
     let sys_face = crate::advanced_style::PAGE;
     let bg_rgb = [
         (sys_face & 0xFF) as u8,
@@ -706,35 +696,26 @@ pub unsafe fn paint_native_modal_extras(_hwnd: HWND, hdc: HDC, app: &AppState) {
 
     match &app.modal {
         ActiveModal::SkinManager => {
+            let mut client: RECT = std::mem::zeroed();
+            windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
+            let split = crate::dialog_layout::skin_split(hwnd).clamp(120, (client.right-160).max(120));
+            let bar = RECT { left: split-2, top:12, right:split+2, bottom:client.bottom-52 };
+            FillRect(hdc, &bar, windows_sys::Win32::Graphics::Gdi::GetSysColorBrush(
+                windows_sys::Win32::Graphics::Gdi::COLOR_3DSHADOW));
             if let Some(entry) = app.skins.get(app.selected_skin_index) {
                 let thumb = entry
                     .preview_gif_path
                     .as_ref()
                     .and_then(|p| RgbaSurface::load_file(p));
                 if let Some(surf) = thumb {
-                    let resized = surf.resize_to(210, 220);
-                    blit_surface_on_bg(hdc, &resized, 204, 14, 210, 220, bg_rgb);
+                    let (width, height) = ((client.right-split-22).max(1), (client.bottom-170).max(1));
+                    let resized = surf.resize_to(width as u32, height as u32);
+                    blit_surface_on_bg(hdc, &resized, split+10, 14, width, height, bg_rgb);
                 }
             }
         }
         ActiveModal::CategoryManager { .. } => {}
-        ActiveModal::EditShortcut(ed) => {
-            if ed.active_tab == 0 {
-                // 当前颜色预览方块
-                let c_ref = ed.text_color.to_colorref();
-                let brush: HBRUSH = CreateSolidBrush(c_ref);
-                if brush != 0 {
-                    let rc = RECT {
-                        left: 68,
-                        top: 181,
-                        right: 138,
-                        bottom: 203,
-                    };
-                    FillRect(hdc, &rc, brush);
-                    windows_sys::Win32::Graphics::Gdi::DeleteObject(brush as _);
-                }
-            }
-        }
+        ActiveModal::EditShortcut(_) => {}
         _ => {}
     }
 }
@@ -793,7 +774,7 @@ pub unsafe fn commit_edit_shortcut_from_controls(
                 } else {
                     icon_key.trim().to_string()
                 };
-                grp.items.push(ShortcutItem {
+                grp.items.push(ShortcutItem { use_default_color: ed_state.use_default_color,
                     id: updated_item_id.clone(),
                     category_id: cat.id.clone(),
                     column_id: grp.id.clone(),
@@ -825,6 +806,7 @@ pub unsafe fn commit_edit_shortcut_from_controls(
                     item.custom_icon_16 = Some(ico.clone());
                 }
                 item.text_color = ed_state.text_color;
+                item.use_default_color = ed_state.use_default_color;
                 item.args = args;
                 item.work_dir = work_dir;
                 item.remark = remark;
@@ -837,11 +819,6 @@ pub unsafe fn commit_edit_shortcut_from_controls(
     app.hotkey_cfg.save(&app.base_dir);
     crate::hotkeys::changed(app.main_hwnd);
     app.persist_data();
-}
-
-/// 读取标准调色板颜色
-pub fn palette_color(idx: usize) -> RgbColor {
-    STANDARD_PALETTE.get(idx).copied().unwrap_or(RgbColor::new(0, 0, 0))
 }
 
 /// 读取当前 ListBox 选中索引

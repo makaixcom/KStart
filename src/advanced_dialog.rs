@@ -5,7 +5,6 @@ use crate::native_dialogs::{create_ctrl, get_ctrl_text, set_ctrl_text};
 use crate::to_wide;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::{HDC, HFONT};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetDlgItem, SendMessageW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
     BS_DEFPUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, ES_AUTOHSCROLL,
@@ -28,8 +27,6 @@ pub const ID_LOGIN_PASSWORD: i32 = 2007;
 pub const ID_LOCK_PASSWORD: i32 = 2008;
 pub const ID_FONT: i32 = 2009;
 pub const ID_SPACING: i32 = 2010;
-const ID_UPDATES: i32 = 2011;
-const ID_UPGRADE: i32 = 2012;
 const ID_OPACITY_VALUE: i32 = 2013;
 const ID_FIELD: i32 = 2100;
 const PAGE_STRIDE: i32 = 100;
@@ -38,6 +35,12 @@ const PICK_OFFSET: i32 = 70;
 
 fn field_id(page: usize, index: usize) -> i32 {
     ID_FIELD + page as i32 * PAGE_STRIDE + index as i32
+}
+
+pub fn color_field(id:i32)->Option<Key> {
+    let offset=id-ID_FIELD;if offset<0{return None;}
+    let field=advanced::FIELDS.get((offset/PAGE_STRIDE) as usize)?.get((offset%PAGE_STRIDE) as usize)?;
+    matches!(field.key,Key::ListBackgroundColor|Key::GroupColor|Key::DefaultColor).then_some(field.key)
 }
 
 fn has_picker(key: Key) -> bool {
@@ -49,6 +52,7 @@ fn has_picker(key: Key) -> bool {
             | Key::ListBackgroundColor
             | Key::GroupColor
             | Key::DefaultColor
+            | Key::TimeFormat
     )
 }
 
@@ -168,7 +172,6 @@ const SECTIONS: &[(usize, &str, i32)] = &[
     (2, "音量控制", 295),
     (2, "清空回收站", 345),
     (3, "颜色", 48),
-    (5, "检查升级", 17),
     (5, "KStart 的快捷方式", 91),
     (5, "数据备份与恢复", 184),
     (5, "验证", 245),
@@ -185,8 +188,6 @@ const ACTIONS: &[(i32, usize, &str, i32, i32, i32)] = &[
     (ID_START_MENU, 5, "添加到开始菜单", 269, 118, 132),
     (ID_LOGIN_PASSWORD, 5, "设置登录口令", 153, 269, 123),
     (ID_LOCK_PASSWORD, 5, "设置锁定口令", 286, 269, 123),
-    (ID_UPDATES, 5, "启动时检查升级", 153, 40, 333),
-    (ID_UPGRADE, 5, "发现升级时自动安装", 153, 61, 333),
 ];
 
 fn field_label(field: &advanced::Field) -> &str {
@@ -200,7 +201,9 @@ fn field_label(field: &advanced::Field) -> &str {
         Key::GroupColor => "栏目文字色",
         Key::DefaultColor => "默认文字色",
         Key::VolumeStep => "幅度（%）",
-        Key::ListOpacity => "列表明度：",
+        Key::ListOpacity => "列表透明：",
+        Key::ListBackground => "列表背景：",
+        Key::TimeFormat => "时间格式：",
         Key::MemoryLimit => "工作集上限（MB，0 为默认）",
         _ => field.label,
     }
@@ -238,6 +241,7 @@ pub unsafe fn populate(
         for (index, field) in fields.iter().enumerate() {
             let id = field_id(page, index);
             let (x, y, width, label_width) = POSITIONS[page][index];
+            let y=if page==5{y-74}else{y};
             let label = field_label(field);
             if matches!(field.kind, FieldKind::Category) {
                 create_ctrl(
@@ -327,6 +331,9 @@ pub unsafe fn populate(
                         }
                         _ => {}
                     }
+                } else if matches!(field.key,Key::ListBackgroundColor|Key::GroupColor|Key::DefaultColor) {
+                    create_ctrl(hwnd,font,"BUTTON","",0,WS_TABSTOP|windows_sys::Win32::UI::WindowsAndMessaging::BS_OWNERDRAW as u32,
+                        field_x,y,field_width,22,id);
                 } else if field.key == Key::ListOpacity {
                     let slider = create_ctrl(hwnd, font, "SCROLLBAR", "", 0,
                         WS_TABSTOP, field_x, y + 3, field_width - 64, 18, id);
@@ -349,44 +356,43 @@ pub unsafe fn populate(
                         id,
                     );
                     if picker {
+                        let icon=matches!(field.key,Key::ListBackground|Key::TimeFormat);
                         let control = create_ctrl(
                             hwnd,
                             font,
                             "BUTTON",
-                            "…",
+                            if icon { "" } else { "…" },
                             0,
-                            WS_TABSTOP,
+                            WS_TABSTOP | if icon { windows_sys::Win32::UI::WindowsAndMessaging::BS_OWNERDRAW as u32 } else { 0 },
                             x + width - 26,
                             y,
                             26,
                             22,
                             id + PICK_OFFSET,
                         );
-                        super::advanced_style::button(control, false, false);
+                        if icon { install_icon_tip(hwnd,control,field.key); }
+                        else {super::advanced_style::button(control, false, false);}
                     }
                 }
             }
         }
     }
-    for &(id, _, label, x, y, width) in ACTIONS {
-        let reserved = matches!(id, ID_UPDATES | ID_UPGRADE);
+    for &(id, page, label, x, y, width) in ACTIONS {
+        let y=if page==5{y-74}else{y};
         let control = create_ctrl(
             hwnd,
             font,
             "BUTTON",
             label,
             0,
-            WS_TABSTOP | if reserved { BS_AUTOCHECKBOX as u32 } else { 0 },
+            WS_TABSTOP,
             x,
             y,
             width,
             23,
             id,
         );
-        if reserved {
-            EnableWindow(control, 0);
-        }
-        super::advanced_style::button(control, reserved, false);
+        super::advanced_style::button(control, false, false);
     }
     for (id, label, x) in [
         (IDOK, "确定", 258),
@@ -428,7 +434,7 @@ fn section_rows(page: usize) -> impl Iterator<Item = (&'static str, i32)> {
     SECTIONS
         .iter()
         .filter(move |&&(section, _, _)| section == page)
-        .map(|&(_, name, y)| (name, y))
+        .map(move |&(_, name, y)| (name, if page==5{y-74}else{y}))
 }
 
 unsafe fn load_page(hwnd: HWND, page: usize, settings: &AdvancedSettings) {
@@ -499,6 +505,9 @@ pub unsafe fn select_page(hwnd: HWND, page: usize) {
 pub unsafe fn reset_page(hwnd: HWND) -> usize {
     let page = current_page(hwnd);
     load_page(hwnd, page, &AdvancedSettings::default());
+    if page == 3 {
+        SendMessageW(GetDlgItem(hwnd,field_id(3,0)),CB_SETCURSEL,0,0);
+    }
     if page == 4 {
         SendMessageW(GetDlgItem(hwnd, field_id(4, 1)), LB_SETCURSEL, 0, 0);
     }
@@ -593,4 +602,64 @@ pub unsafe fn update_opacity_value(hwnd: HWND, slider: HWND, message: usize) {
         SendMessageW(slider, SBM_SETPOS, value as usize, 1);
         set_ctrl_text(hwnd, ID_OPACITY_VALUE, &opacity_status(value));
     }
+}
+
+pub const TIME_FORMAT_HELP: &str = "week - 星期X\ntime - 时间\ny - 年\nm - 月\nd - 日\nww - 一年的第几周\nst - 开机了多久\n\\n - 回车符\n\\b - 空格\n\\* - 不显示时间标签";
+
+unsafe fn install_icon_tip(owner:HWND,control:HWND,key:Key) {
+    use windows_sys::Win32::{UI::{Controls::*,Shell::SetWindowSubclass},System::LibraryLoader::GetModuleHandleW};
+    use std::{ptr,mem,sync::OnceLock};
+    static TEXT:OnceLock<[Vec<u16>;2]>=OnceLock::new();
+    let text=TEXT.get_or_init(||[to_wide("选择列表背景图片"),to_wide(TIME_FORMAT_HELP)]);
+    let tip=windows_sys::Win32::UI::WindowsAndMessaging::CreateWindowExW(
+        windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW | windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST,
+        to_wide("tooltips_class32").as_ptr(),ptr::null(),windows_sys::Win32::UI::WindowsAndMessaging::WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,
+        0,0,0,0,owner,0,GetModuleHandleW(ptr::null()),ptr::null());
+    if tip!=0 {
+        let mut tool:TTTOOLINFOW=mem::zeroed();tool.cbSize=mem::size_of::<TTTOOLINFOW>() as u32;
+        tool.uFlags=TTF_IDISHWND|TTF_SUBCLASS;tool.hwnd=owner;tool.uId=control as usize;
+        tool.lpszText=text[usize::from(key==Key::TimeFormat)].as_ptr().cast_mut();
+        if SendMessageW(tip,TTM_ADDTOOLW,0,&tool as *const _ as isize)==0 {
+            // 兼容未启用 v6 清单时的旧版公共控件 TOOLINFO 大小。
+            tool.cbSize=std::mem::offset_of!(TTTOOLINFOW,lpReserved) as u32;
+            SendMessageW(tip,TTM_ADDTOOLW,0,&tool as *const _ as isize);
+        }
+        SendMessageW(tip,TTM_SETTIPTEXTCOLOR,0x00800000,0);
+        SendMessageW(tip,TTM_SETMAXTIPWIDTH,0,220);
+        SendMessageW(tip,TTM_SETDELAYTIME,TTDT_INITIAL as usize,150);
+        SendMessageW(tip,TTM_SETDELAYTIME,TTDT_AUTOPOP as usize,20000);
+    }
+    SetWindowSubclass(control,Some(icon_proc),1,0);
+}
+
+unsafe extern "system" fn icon_proc(hwnd:HWND,msg:u32,wp:usize,lp:isize,_:usize,_:usize)->isize {
+    use windows_sys::Win32::UI::{Shell::{DefSubclassProc,RemoveWindowSubclass},WindowsAndMessaging::*};
+    if msg==WM_SETCURSOR {SetCursor(LoadCursorW(0,IDC_HAND));return 1;}
+    if msg==WM_NCDESTROY {RemoveWindowSubclass(hwnd,Some(icon_proc),1);}
+    DefSubclassProc(hwnd,msg,wp,lp)
+}
+
+pub unsafe fn draw_picker_icon(draw:&windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT)->bool {
+    use windows_sys::Win32::{Graphics::Gdi::*,UI::{Controls::ODS_FOCUS,WindowsAndMessaging::*}};
+    let Some((_,key))=picker(draw.CtlID as i32) else{return false;};
+    if !matches!(key,Key::ListBackground|Key::TimeFormat){return false;}
+    FillRect(draw.hDC,&draw.rcItem,crate::advanced_style::static_color(draw.hDC));
+    let size=12;
+    let x=draw.rcItem.left+(draw.rcItem.right-draw.rcItem.left-size)/2;
+    let y=draw.rcItem.top+(draw.rcItem.bottom-draw.rcItem.top-size)/2;
+    if key==Key::TimeFormat {
+        let icon=LoadImageW(0,IDI_INFORMATION,IMAGE_ICON,size,size,0);
+        if icon!=0 {DrawIconEx(draw.hDC,x,y,icon,size,size,0,0,DI_NORMAL);DestroyIcon(icon);}
+    }else{
+        static ICON:std::sync::OnceLock<Option<crate::skin_assets::RgbaSurface>>=std::sync::OnceLock::new();
+        if let Some(icon)=ICON.get_or_init(||{
+            let image=image::load_from_memory(include_bytes!("../assets/icons/ctx_add_file.png")).ok()?.to_rgba8();
+            Some(crate::skin_assets::RgbaSurface::from_pixels(image.width(),image.height(),image.pixels().map(|p|p.0).collect()))
+        }) {
+            let color=crate::advanced_style::PAGE;
+            crate::native_dialogs::blit_surface_on_bg(draw.hDC,icon,x,y,size,size,[color as u8,(color>>8) as u8,(color>>16) as u8]);
+        }
+    }
+    if draw.itemState&ODS_FOCUS!=0{DrawFocusRect(draw.hDC,&draw.rcItem);}
+    true
 }

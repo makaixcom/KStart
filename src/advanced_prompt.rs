@@ -26,7 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWLP_USERDATA, IDCANCEL, IDOK, LBN_SELCHANGE, LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL,
     LB_SETCURSEL, WM_COMMAND, WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_INITDIALOG, WM_PAINT,
     WM_PRINTCLIENT, WS_CAPTION, WS_EX_CLIENTEDGE, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
-    WS_VSCROLL,
+    WS_VSCROLL, WS_THICKFRAME,
 };
 
 enum Prompt {
@@ -93,7 +93,7 @@ unsafe fn font_slot(hwnd: HWND) -> usize {
 }
 
 unsafe fn show(owner: HWND, title: &str, (w, h): (u16, u16), prompt: &mut Prompt) -> bool {
-    let style = WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU | DS_CENTER as u32;
+    let style = WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | DS_CENTER as u32;
     // DLGTEMPLATE 的 32 位字段在缓冲区中按两个 WORD 编码，后接菜单、窗口类和标题。
     let mut template = vec![
         style as u16,
@@ -398,6 +398,7 @@ unsafe extern "system" fn wnd_proc(
         if let Some(state) = (lparam as *const Prompt).as_ref() {
             populate(hwnd, state);
         }
+        crate::dialog_layout::install(hwnd, false);
         return 1;
     }
     if message != WM_COMMAND {
@@ -420,7 +421,9 @@ unsafe extern "system" fn wnd_proc(
                     } else {
                         wparam as _
                     };
-                    advanced_style::paint_child(dc, client.right, client.bottom, footer);
+                    let base = crate::dialog_layout::base_size(hwnd);
+                    let saved = crate::dialog_layout::begin_paint_scale(hwnd, dc, base);
+                    advanced_style::paint_child(dc, base.0, base.1, footer);
                     match state {
                         Prompt::Fonts(fonts) => {
                             advanced_style::paint_font_preview(dc, &fonts[font_slot(hwnd)])
@@ -430,6 +433,7 @@ unsafe extern "system" fn wnd_proc(
                         }
                         _ => {}
                     }
+                    windows_sys::Win32::Graphics::Gdi::RestoreDC(dc, saved);
                     if message == WM_PAINT {
                         EndPaint(hwnd, &paint);
                     }

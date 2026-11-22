@@ -43,7 +43,7 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("清空回收站", "kstart:recycle"),
 ];
 
-pub fn execute(hwnd: HWND, name: &str, settings: &AdvancedSettings) {
+pub fn execute(hwnd: HWND, name: &str, settings: &AdvancedSettings) -> bool {
     let power = matches!(
         name,
         "shutdown" | "restart" | "logoff" | "hibernate" | "sleep"
@@ -56,7 +56,7 @@ pub fn execute(hwnd: HWND, name: &str, settings: &AdvancedSettings) {
             .find(|(_, target)| target.strip_prefix("kstart:") == Some(name))
             .map_or("运行此系统功能", |(label, _)| *label);
         if !confirm(hwnd, &format!("确定要{action}吗？")) {
-            return;
+            return false;
         }
     }
     let ok = unsafe {
@@ -130,6 +130,7 @@ pub fn execute(hwnd: HWND, name: &str, settings: &AdvancedSettings) {
     if !ok {
         message(hwnd, "系统未能完成这个操作，请检查设备是否可用。");
     }
+    ok
 }
 
 unsafe fn change_volume(delta: f32) -> windows::core::Result<u8> {

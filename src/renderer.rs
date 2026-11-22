@@ -93,6 +93,7 @@ pub struct EditShortcutDialogState {
     /// 新建或自选图标时暂存的 16x16 图标表面（点确定后才正式保存）
     pub pending_icon_16: Option<RgbaSurface>,
     pub text_color: RgbColor,
+    pub use_default_color: bool,
     pub args: String,
     pub work_dir: String,
     pub hotkey: String,
@@ -207,7 +208,7 @@ pub enum HitTarget {
     EditScPickFile,
     EditScPickDir,
     EditScPickIcon,
-    EditScColorPalette(usize),
+    EditScPickColor,
     EditScToggleMinOnRun,
     EditScOk,
     EditScCancel,
@@ -215,21 +216,8 @@ pub enum HitTarget {
     /// 关于快速启动窗口控件
     AboutLink(usize),
     AboutSupportLink,
-    AboutCheckUpdate,
     AboutClose,
 }
-
-/// 8 个标准调色板颜色
-pub const STANDARD_PALETTE: [RgbColor; 8] = [
-    RgbColor::new(0x00, 0x00, 0x00),
-    RgbColor::new(0xFF, 0x00, 0x00),
-    RgbColor::new(0x00, 0xFF, 0x00),
-    RgbColor::new(0xFF, 0xFF, 0x00),
-    RgbColor::new(0x00, 0x00, 0xFF),
-    RgbColor::new(0xFF, 0x00, 0xFF),
-    RgbColor::new(0x00, 0xFF, 0xFF),
-    RgbColor::new(0xFF, 0xFF, 0xFF),
-];
 
 /// 主窗口渲染上下文只读快照
 #[allow(dead_code)]
@@ -276,8 +264,9 @@ fn clamp_menu_height(win_h: i32, total_rows: usize, top_margin: i32, bottom_marg
 
 /// 左下角主菜单矩形 `(x, y, w, h)`
 pub fn get_popup_menu_rect(_win_w: i32, win_h: i32) -> (i32, i32, i32, i32) {
-    let (h, vis_rows) = clamp_menu_height(win_h, 16, 8, 40);
-    let w = if vis_rows < 16 { 176 } else { 162 };
+    let count = build_popup_menu_items(false,false,false,true,true,false).len();
+    let (h, vis_rows) = clamp_menu_height(win_h, count, 8, 40);
+    let w = if vis_rows < count { 176 } else { 162 };
     let x = 10;
     let y = (win_h - 40 - h).max(8);
     (x, y, w, h)
@@ -298,8 +287,9 @@ pub fn get_skin_quick_menu_rect(win_w: i32, win_h: i32, skins_count: usize) -> (
 
 /// 内容区空白处右键菜单矩形 `(x, y, w, h)`
 pub fn get_context_menu_rect(win_w: i32, win_h: i32, req_x: i32, req_y: i32) -> (i32, i32, i32, i32) {
-    let (h, vis_rows) = clamp_menu_height(win_h, 16, 24, 8);
-    let w = if vis_rows < 16 { 176 } else { 162 };
+    let count = build_context_menu_items().len();
+    let (h, vis_rows) = clamp_menu_height(win_h, count, 24, 8);
+    let w = if vis_rows < count { 176 } else { 162 };
     let x = req_x.clamp(8, (win_w - w - 8).max(8));
     let y = req_y.clamp(24, (win_h - h - 8).max(24));
     (x, y, w, h)
@@ -317,7 +307,8 @@ pub fn get_item_menu_rect(win_w: i32, win_h: i32, req_x: i32, req_y: i32) -> (i3
 /// 获取当前弹出菜单的项目总数。
 pub fn popup_item_count(menu: ActivePopupMenu, skins_count: usize) -> usize {
     match menu {
-        ActivePopupMenu::MainMenu | ActivePopupMenu::ContextMenu { .. } => 16,
+        ActivePopupMenu::MainMenu => build_popup_menu_items(false,false,false,true,true,false).len(),
+        ActivePopupMenu::ContextMenu { .. } => build_context_menu_items().len(),
         ActivePopupMenu::SkinQuickMenu => skins_count + 2,
         ActivePopupMenu::ItemMenu { .. } => 12,
         ActivePopupMenu::SearchMode => SearchMode::OPTIONS.len(),
@@ -681,7 +672,7 @@ pub fn shortcut_grid(cfg: &SkinConfig, w: i32, h: i32, cat: &CategoryTab, settin
         else { (usable_width / spacing).max(1) } as usize;
     let drawn_height = row_height - 7;
     let rows = if bottom - top < drawn_height { 0 } else { ((bottom - top - drawn_height) / row_height + 1) as usize };
-    if count > rows * cols && settings.enabled(Setting::Horizontal) {
+    if count > rows * cols && settings.enabled(Setting::Horizontal) && settings.enabled(Setting::Scrollbar) {
         cols = ((usable_width - SKIN_MENU_SCROLLBAR_WIDTH).max(1) / spacing).max(1) as usize;
     }
     // 间距设置决定固定列宽，窗口缩放只改变列数，不摊分剩余宽度。
@@ -782,7 +773,7 @@ pub fn hit_test_main(
             }
             if mx >= lx + lw - SKIN_MENU_SCROLLBAR_WIDTH - 1 {
                 if let Some(grid) = shortcut_grid(cfg, win_w, win_h, cat, settings) {
-                    if grid.max_scroll > 0 && my >= grid.top && my < grid.bottom {
+                    if settings.enabled(Setting::Scrollbar) && grid.max_scroll > 0 && my >= grid.top && my < grid.bottom {
                         return HitTarget::ListScroll(my - grid.top);
                     }
                 }
@@ -929,12 +920,7 @@ pub fn hit_test_modal(
             if in_rect(76, 184, dw - 140, 22) {
                 return HitTarget::EditScField(EditShortcutField::IconKey);
             }
-            for c_idx in 0..8 {
-                let cx = 154 + (c_idx as i32) * 21;
-                if in_rect(cx, 214, 18, 18) {
-                    return HitTarget::EditScColorPalette(c_idx);
-                }
-            }
+            if in_rect(76,214,dw-110,22) {return HitTarget::EditScPickColor;}
             if in_rect(76, 266, dw - 110, 22) {
                 return HitTarget::EditScField(EditShortcutField::Args);
             }
@@ -955,9 +941,6 @@ pub fn hit_test_modal(
             }
             if my < 24 {
                 return HitTarget::ModalTitleDrag;
-            }
-            if in_rect(352, 398, 72, 22) {
-                return HitTarget::AboutCheckUpdate;
             }
             if in_rect(14, 400, 190, 20) {
                 return HitTarget::AboutSupportLink;
@@ -1099,12 +1082,12 @@ pub fn render_main_frame(
         x: time_x,
         y: time_y,
         w: 220,
-        h: 14,
+        h: if state.volume_level.is_some(){14}else{14 * state.time_string.lines().count().max(1) as i32},
         color: cfg.time_label_color,
         bold: cfg.time_label_bold,
         align: TextAlign::Left,
         mnemonic: false,
-        multiline: false,
+        multiline: state.volume_level.is_none() && state.time_string.contains('\n'),
         font_slot: Some(3),
     });
 
@@ -1256,7 +1239,8 @@ pub fn render_main_frame(
                         color: if is_selected {
                             RgbColor::new(255, 255, 255)
                         } else {
-                            item.text_color
+                            if item.use_default_color { crate::advanced::color(settings.text(Setting::DefaultColor)).unwrap_or(RgbColor::new(0,0,0)) }
+                            else { item.text_color }
                         },
                         bold: false,
                         align: if below { TextAlign::Center } else { TextAlign::Left },
@@ -1267,7 +1251,7 @@ pub fn render_main_frame(
                 }
                 {
                     if let Some(grid) = shortcut_grid(cfg, w, h, cat, settings) {
-                        if grid.max_scroll > 0 {
+                        if grid.max_scroll > 0 && settings.enabled(Setting::Scrollbar) {
                             let height = grid.bottom - grid.top;
                             draw_flat_scrollbar(canvas, lx + lw - SKIN_MENU_SCROLLBAR_WIDTH - 1,
                                 grid.top, SKIN_MENU_SCROLLBAR_WIDTH, height, grid.rows,
@@ -1646,8 +1630,6 @@ fn render_generic_popup_menu_with_bar<A: Copy>(
             MenuIconKind::Options => canvas.blit(&builtin.menu_options, menu_x + 5, item_y + 4),
             MenuIconKind::Hotkey => canvas.blit(&builtin.menu_hotkey, menu_x + 5, item_y + 4),
             MenuIconKind::Schedule => canvas.blit(&builtin.menu_schedule, menu_x + 5, item_y + 4),
-            MenuIconKind::Mail => canvas.blit(&builtin.menu_mail, menu_x + 5, item_y + 4),
-            MenuIconKind::Folder => canvas.blit(&builtin.menu_folder, menu_x + 5, item_y + 4),
             MenuIconKind::Skin => canvas.blit(&builtin.menu_skin, menu_x + 5, item_y + 4),
             MenuIconKind::Exit => canvas.blit(&builtin.menu_exit, menu_x + 5, item_y + 4),
             MenuIconKind::CtxAddFile => canvas.blit(&builtin.ctx_add_file, menu_x + 5, item_y + 4),
@@ -1665,7 +1647,6 @@ fn render_generic_popup_menu_with_bar<A: Copy>(
             MenuIconKind::CtxClearCol => {
                 canvas.blit(&builtin.ctx_clear_col, menu_x + 5, item_y + 4)
             }
-            MenuIconKind::CtxLockCol => canvas.blit(&builtin.ctx_lock_col, menu_x + 5, item_y + 4),
             MenuIconKind::CtxDelCol => canvas.blit(&builtin.ctx_del_col, menu_x + 5, item_y + 4),
             MenuIconKind::ItemDelete => canvas.blit(&builtin.im_delete, menu_x + 5, item_y + 4),
             MenuIconKind::ItemCut => canvas.blit(&builtin.im_cut, menu_x + 5, item_y + 4),
@@ -2174,16 +2155,6 @@ fn render_about_dialog(
         font_slot: None,
     });
 
-    draw_classic_button(
-        canvas,
-        texts,
-        352,
-        398,
-        72,
-        22,
-        "检查升级",
-        ctx.hover_target == HitTarget::AboutCheckUpdate,
-    );
     draw_classic_button(
         canvas,
         texts,
@@ -2765,34 +2736,8 @@ fn render_edit_shortcut_dialog(
             multiline: false,
             font_slot: None,
         });
-        canvas.fill_rect(76, 214, 72, 20, ed.text_color);
-        canvas.stroke_3d_rect(
-            76,
-            214,
-            72,
-            20,
-            RgbColor::new(0x80, 0x80, 0x80),
-            RgbColor::new(255, 255, 255),
-        );
-        for (c_idx, &col) in STANDARD_PALETTE.iter().enumerate() {
-            let cx = 154 + (c_idx as i32) * 21;
-            canvas.fill_rect(cx, 214, 18, 18, col);
-            canvas.stroke_rect(cx, 214, 18, 18, RgbColor::new(0x60, 0x60, 0x60));
-        }
-
-        texts.push(TextDrawCmd {
-            text: "☐ 设为默认色  ☐ 应用到本栏目所有快捷方式".to_string(),
-            x: 76,
-            y: 240,
-            w: dw - 92,
-            h: 18,
-            color: RgbColor::new(0, 0, 0),
-            bold: false,
-            align: TextAlign::Left,
-            mnemonic: false,
-            multiline: false,
-            font_slot: None,
-        });
+        draw_classic_button(canvas,texts,76,214,dw-110,22,"▼",ctx.hover_target==HitTarget::EditScPickColor);
+        canvas.fill_rect(79,217,dw-135,16,if ed.use_default_color{RgbColor::new(0,0,0)}else{ed.text_color});
 
         draw_row_input(canvas, texts, "参 数:", 266, &ed.args, EditShortcutField::Args);
         draw_row_input(

@@ -73,7 +73,7 @@ pub struct ShortcutRecord {
     /// 备注说明
     #[serde(default)]
     pub remark: String,
-    /// 显示文字颜色（十六进制如 `"#000000"`）
+    /// 显示文字颜色：空字符串跟随默认色，显式十六进制颜色保留旧版行为。
     #[serde(default = "default_text_color_hex")]
     pub text_color: String,
     /// 运行后是否最小化快速启动
@@ -119,6 +119,22 @@ pub struct AppDataStore {
 #[cfg(test)]
 mod icon_cache_tests {
     use super::*;
+    #[test]
+    fn empty_text_color_inherits_default_and_explicit_black_is_preserved() {
+        let base=std::env::temp_dir().join(format!("kstart-default-color-audit-{}",std::process::id()));
+        let mut store=AppDataStore::default_store();store.shortcuts[0].text_color.clear();
+        store.shortcuts[1].text_color="#000000".into();
+        let tree=store.build_runtime_tree(&base,&Default::default(),&Default::default());
+        let all:Vec<_>=tree.iter().flat_map(|cat|&cat.groups).flat_map(|group|&group.items).collect();
+        assert!(all.iter().find(|item|item.id==store.shortcuts[0].id).unwrap().use_default_color);
+        assert!(!all.iter().find(|item|item.id==store.shortcuts[1].id).unwrap().use_default_color);
+        store.sync_from_runtime_tree(&tree,&base);
+        let saved=AppDataStore::load(&base);
+        assert!(saved.shortcuts.iter().find(|item|item.id=="sc_1").unwrap().text_color.is_empty());
+        assert_eq!(saved.shortcuts.iter().find(|item|item.id=="sc_2").unwrap().text_color,"#000000");
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn source_path_and_internal_icon_cache_remain_independent() {
         let mut store = AppDataStore::default_store();
@@ -226,6 +242,7 @@ impl AppDataStore {
                             work_dir: sc.work_dir,
                             remark: sc.remark,
                             text_color: parse_hex_color(&sc.text_color),
+                            use_default_color: sc.text_color.is_empty(),
                             minimize_on_run: sc.minimize_on_run,
                             custom_icon_16,
                         }
@@ -297,7 +314,7 @@ impl AppDataStore {
                         args: item.args.clone(),
                         work_dir: item.work_dir.clone(),
                         remark: item.remark.clone(),
-                        text_color: format_hex_color(item.text_color),
+                        text_color: if item.use_default_color { String::new() } else {format_hex_color(item.text_color)},
                         minimize_on_run: item.minimize_on_run,
                         sort_order: (s_idx + 1) as i32,
                     });
@@ -547,6 +564,7 @@ pub struct ShortcutItem {
     pub work_dir: String,
     pub remark: String,
     pub text_color: RgbColor,
+    pub use_default_color: bool,
     pub minimize_on_run: bool,
     pub custom_icon_16: Option<RgbaSurface>,
 }
@@ -585,9 +603,6 @@ pub enum MenuAction {
     OpenAdvancedOptions,
     OpenHotkeyManager,
     OpenScheduleManager,
-    OpenMailChecker,
-    OpenFolderProtection,
-    CheckUpdate,
     OpenSkinManager,
     SupportAuthor,
     AboutApp,
@@ -610,7 +625,6 @@ pub enum ContextMenuAction {
     BatchExportImport,
     PasteItem,
     ClearColumn,
-    EncryptColumn,
     RenameColumnTitle,
     DeleteColumn,
 }
@@ -640,8 +654,6 @@ pub enum MenuIconKind {
     Options,
     Hotkey,
     Schedule,
-    Mail,
-    Folder,
     Skin,
     Exit,
     CtxAddFile,
@@ -653,7 +665,6 @@ pub enum MenuIconKind {
     CtxAppearance,
     CtxPaste,
     CtxClearCol,
-    CtxLockCol,
     CtxDelCol,
     ItemDelete,
     ItemCut,
@@ -675,7 +686,7 @@ pub struct PopupMenuItem<A: Copy> {
     pub has_separator_below: bool,
 }
 
-/// 构建左下角 16 项自绘主菜单
+/// 构建左下角自绘主菜单
 pub fn build_popup_menu_items(
     always_on_top: bool,
     pin_to_desktop: bool,
@@ -749,27 +760,6 @@ pub fn build_popup_menu_items(
             has_separator_below: true,
         },
         PopupMenuItem {
-            action: MenuAction::OpenMailChecker,
-            label: "邮箱检测(&E)".to_string(),
-            icon: MenuIconKind::Mail,
-            custom_text_color: None,
-            has_separator_below: false,
-        },
-        PopupMenuItem {
-            action: MenuAction::OpenFolderProtection,
-            label: "文件夹保护(&F)".to_string(),
-            icon: MenuIconKind::Folder,
-            custom_text_color: None,
-            has_separator_below: true,
-        },
-        PopupMenuItem {
-            action: MenuAction::CheckUpdate,
-            label: "检查升级(&U)...".to_string(),
-            icon: MenuIconKind::None,
-            custom_text_color: None,
-            has_separator_below: false,
-        },
-        PopupMenuItem {
             action: MenuAction::OpenSkinManager,
             label: "皮肤管理器(&S)...".to_string(),
             icon: MenuIconKind::Skin,
@@ -800,7 +790,7 @@ pub fn build_popup_menu_items(
     ]
 }
 
-/// 构建内容区右键单击弹出的 16 项菜单（1:1 复刻截图 4）
+/// 构建内容区右键单击弹出的菜单（1:1 复刻截图 4）
 pub fn build_context_menu_items() -> Vec<PopupMenuItem<ContextMenuAction>> {
     vec![
         PopupMenuItem {
@@ -893,13 +883,6 @@ pub fn build_context_menu_items() -> Vec<PopupMenuItem<ContextMenuAction>> {
             icon: MenuIconKind::CtxClearCol,
             custom_text_color: None,
             has_separator_below: true,
-        },
-        PopupMenuItem {
-            action: ContextMenuAction::EncryptColumn,
-            label: "栏目加密".to_string(),
-            icon: MenuIconKind::CtxLockCol,
-            custom_text_color: Some(RgbColor::new(0x80, 0x00, 0x00)),
-            has_separator_below: false,
         },
         PopupMenuItem {
             action: ContextMenuAction::RenameColumnTitle,
