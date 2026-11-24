@@ -1,0 +1,81 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+      RUSTFLAGS: '-C target-feature=+crt-static'
+    steps:
+      - name: 拉取源码
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 准备 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup target add x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 运行测试
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: 编译 Windows x64 发行版
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      - name: 打包程序及皮肤资源
+        id: package
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'manual-' + $env:GITHUB_SHA.Substring(0, 7) }
+          & ./scripts/package-windows.ps1 -Version $version
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: KStart-${{ steps.package.outputs.version }}-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+      - name: 发布 GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $files = @(Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName })
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @files --repo $env:GITHUB_REPOSITORY --clobber
+          } else {
+            $options = @('--repo', $env:GITHUB_REPOSITORY, '--verify-tag', '--generate-notes', '--title', "KStart $tag")
+            if ($tag.Contains('-')) { $options += '--prerelease' }
+            gh release create $tag @files @options
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

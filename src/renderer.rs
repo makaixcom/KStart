@@ -53,7 +53,7 @@ pub enum ActivePopupMenu {
     /// 搜索按钮旁的模式菜单
     SearchMode,
     TrayStart { category: usize, count: usize, x: i32, y: i32 },
-    /// 内容区空白处右键单击弹出的 16 项菜单
+    /// 内容区空白处的右键菜单
     ContextMenu { x: i32, y: i32 },
     /// 对着快捷方式图标右键单击弹出的 12 项菜单
     ItemMenu {
@@ -1636,9 +1636,6 @@ fn render_generic_popup_menu_with_bar<A: Copy>(
             MenuIconKind::CtxAddDir => canvas.blit(&builtin.ctx_add_dir, menu_x + 5, item_y + 4),
             MenuIconKind::CtxAddUrl => canvas.blit(&builtin.ctx_add_url, menu_x + 5, item_y + 4),
             MenuIconKind::CtxAddSys => canvas.blit(&builtin.ctx_add_sys, menu_x + 5, item_y + 4),
-            MenuIconKind::CtxAddLogin => {
-                canvas.blit(&builtin.ctx_add_login, menu_x + 5, item_y + 4)
-            }
             MenuIconKind::CtxSearch => canvas.blit(&builtin.ctx_search, menu_x + 5, item_y + 4),
             MenuIconKind::CtxAppearance => {
                 canvas.blit(&builtin.ctx_appearance, menu_x + 5, item_y + 4)
@@ -1750,7 +1747,7 @@ fn render_generic_popup_menu_with_bar<A: Copy>(
     }
 }
 
-fn flat_scrollbar_metrics(height: i32, visible: usize, total: usize, scroll: usize) -> (i32, i32, i32) {
+pub(crate) fn flat_scrollbar_metrics(height: i32, visible: usize, total: usize, scroll: usize) -> (i32, i32, i32) {
     let track = (height - 28).max(1);
     let thumb = ((track as usize * visible) / total.max(1))
         .clamp(24.min(track as usize), track as usize) as i32;
@@ -1760,7 +1757,7 @@ fn flat_scrollbar_metrics(height: i32, visible: usize, total: usize, scroll: usi
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_flat_scrollbar(canvas: &mut Canvas, x: i32, y: i32, width: i32, height: i32,
+pub(crate) fn draw_flat_scrollbar(canvas: &mut Canvas, x: i32, y: i32, width: i32, height: i32,
     visible: usize, total: usize, scroll: usize) {
     if height < 30 { return; }
     canvas.fill_rect(x, y, width - 1, height, RgbColor::new(245, 245, 245));
@@ -2623,7 +2620,6 @@ fn render_edit_shortcut_dialog(
         canvas.blit(&ctx.builtin_icons.ctx_add_file, 248, 127);
         canvas.blit(&ctx.builtin_icons.ctx_add_dir, 268, 127);
         canvas.blit(&ctx.builtin_icons.ctx_add_sys, 288, 127);
-        canvas.blit(&ctx.builtin_icons.ctx_add_login, 308, 127);
 
         let draw_row_input = |canvas: &mut Canvas,
                               texts: &mut Vec<TextDrawCmd>,

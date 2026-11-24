@@ -9,9 +9,9 @@ use crate::skin_assets::RgbaSurface;
 use crate::{to_wide, AppState};
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::{
-    FillRect, InvalidateRect, SetBkMode, SetDIBitsToDevice,
+    InvalidateRect, SetBkMode, SetDIBitsToDevice,
     BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, HFONT,
     TRANSPARENT,
 };
@@ -21,9 +21,10 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
     CreateWindowExW, GetDlgItem, GetWindowTextLengthW, GetWindowTextW, SendMessageW,
     SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON,
-    BS_OWNERDRAW, BS_PUSHBUTTON, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
+    BS_OWNERDRAW, BS_PUSHBUTTON, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
     ES_WANTRETURN, IDCANCEL, IDOK, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL,
     LB_RESETCONTENT, LB_SETCURSEL, SW_HIDE, SW_SHOW, WM_SETFONT, WS_BORDER, WS_CHILD,
     WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
@@ -74,21 +75,25 @@ pub const ID_EDIT_LBL_HK: i32 = 1415;
 pub const ID_EDIT_HK: i32 = 1416;
 pub const ID_EDIT_CHK_MIN: i32 = 1417;
 pub const ID_EDIT_REMARK: i32 = 1418;
+pub const ID_EDIT_LBL_KIND: i32 = 1419;
+pub const ID_EDIT_KIND: i32 = 1420;
+pub const ID_EDIT_LBL_PATH_MODE: i32 = 1421;
+pub const ID_EDIT_PATH_MODE: i32 = 1422;
 pub const ID_EDIT_COLOR_BASE: i32 = 1450; // 统一文字颜色选择器
 
 /// 弹窗客户区基础宽高 `(width, height)` 与标题
 pub fn native_modal_client_info(modal: &ActiveModal) -> (i32, i32, &'static str) {
     match modal {
         ActiveModal::Advanced(_) => (crate::advanced_dialog::WIDTH, crate::advanced_dialog::HEIGHT, "高级设置"),
-        ActiveModal::SkinManager => (430, 390, "皮肤管理器"),
+        ActiveModal::SkinManager => (760, 680, "皮肤管理器"),
         ActiveModal::CategoryManager { .. } => (410, 438, "类别管理"),
         ActiveModal::ColumnSort { .. } => (350, 320, "栏目排序"),
         ActiveModal::Search(_) => (crate::search_dialog::WIDTH, crate::search_dialog::HEIGHT, "搜索"),
         ActiveModal::EditShortcut(ed) => {
             if ed.is_new {
-                (380, 400, "新建快捷方式")
+                (380, 432, "新建快捷方式")
             } else {
-                (380, 400, "修改快捷方式")
+                (380, 432, "修改快捷方式")
             }
         }
         _ => (0, 0, ""),
@@ -109,6 +114,22 @@ pub(crate) unsafe fn create_ctrl(
     h: i32,
     id: i32,
 ) -> HWND {
+    let ctrl = create_classic_ctrl(parent, hfont, cls, text, ex_style, style, x, y, w, h, id);
+    if cls.eq_ignore_ascii_case("BUTTON") {
+        let kind = style & 0xf;
+        if kind <= BS_AUTOCHECKBOX as u32 {
+            crate::advanced_style::button(ctrl, kind == BS_AUTOCHECKBOX as u32 || kind == 2,
+                id == IDOK);
+        }
+    }
+    ctrl
+}
+
+/// 经典对话框保留系统原生按钮，与旧版管理界面的布局和交互一致。
+pub(crate) unsafe fn create_classic_ctrl(
+    parent: HWND, hfont: HFONT, cls: &str, text: &str, ex_style: u32, style: u32,
+    x: i32, y: i32, w: i32, h: i32, id: i32,
+) -> HWND {
     let hinstance = GetModuleHandleW(ptr::null());
     let w_cls = to_wide(cls);
     let w_txt = to_wide(text);
@@ -128,13 +149,6 @@ pub(crate) unsafe fn create_ctrl(
     );
     if ctrl != 0 && hfont != 0 {
         SendMessageW(ctrl, WM_SETFONT, hfont as usize, 1);
-    }
-    if cls.eq_ignore_ascii_case("BUTTON") {
-        let kind = style & 0xf;
-        if kind <= BS_AUTOCHECKBOX as u32 {
-            crate::advanced_style::button(ctrl, kind == BS_AUTOCHECKBOX as u32 || kind == 2,
-                id == IDOK);
-        }
     }
     ctrl
 }
@@ -172,73 +186,7 @@ unsafe fn listbox_add(lb: HWND, text: &str) {
 /// 在原生窗口上创建对应弹窗的全部子控件
 pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
     match &app.modal {
-        ActiveModal::SkinManager => {
-            let lb = create_ctrl(
-                hwnd,
-                hfont,
-                "LISTBOX",
-                "",
-                WS_EX_CLIENTEDGE,
-                WS_BORDER | WS_VSCROLL | WS_TABSTOP | (LBS_NOTIFY as u32) | (LBS_NOINTEGRALHEIGHT as u32),
-                12,
-                12,
-                176,
-                326,
-                ID_SKIN_LIST,
-            );
-            for s in &app.skins {
-                listbox_add(lb, &s.name);
-            }
-            if !app.skins.is_empty() {
-                let sel = app.selected_skin_index.min(app.skins.len() - 1);
-                SendMessageW(lb, LB_SETCURSEL, sel, 0);
-            }
-
-            create_ctrl(
-                hwnd,
-                hfont,
-                "EDIT",
-                app.skins
-                    .get(app.selected_skin_index)
-                    .map(|s| s.author_info.as_str())
-                    .unwrap_or(""),
-                WS_EX_CLIENTEDGE,
-                (ES_MULTILINE as u32) | (ES_READONLY as u32) | (ES_AUTOVSCROLL as u32) | WS_VSCROLL,
-                200,
-                244,
-                218,
-                94,
-                ID_SKIN_AUTHOR_EDIT,
-            );
-
-            create_ctrl(
-                hwnd,
-                hfont,
-                "BUTTON",
-                "应用(&A)",
-                0,
-                WS_TABSTOP | (BS_DEFPUSHBUTTON as u32),
-                252,
-                350,
-                78,
-                26,
-                ID_SKIN_APPLY,
-            );
-            create_ctrl(
-                hwnd,
-                hfont,
-                "BUTTON",
-                "关闭(&C)",
-                0,
-                WS_TABSTOP | (BS_PUSHBUTTON as u32),
-                340,
-                350,
-                78,
-                26,
-                IDCANCEL,
-            );
-            SetFocus(lb);
-        }
+        ActiveModal::SkinManager => { crate::skin_manager::populate(hwnd, hfont, app); }
 
         ActiveModal::CategoryManager { selected_idx, .. } => {
             crate::category_dialog::populate(hwnd, hfont, app, *selected_idx);
@@ -330,7 +278,7 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
                 10,
                 10,
                 360,
-                340,
+                372,
                 ID_EDIT_TAB,
             );
             let mut w_t0 = to_wide("常规");
@@ -376,7 +324,13 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
                 ID_EDIT_TITLE,
             );
 
-            create_ctrl(hwnd, hfont, "STATIC", "链接:", 0, 0, 22, 86, 42, 18, ID_EDIT_LBL_LINK);
+            create_ctrl(hwnd, hfont, "STATIC", "类型:", 0, 0, 22, 86, 42, 18, ID_EDIT_LBL_KIND);
+            create_ctrl(hwnd, hfont, "COMBOBOX", "", 0,
+                WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32, 68, 82, 206, 160, ID_EDIT_KIND);
+            create_ctrl(hwnd, hfont, "STATIC", "路径:", 0, 0, 22, 118, 42, 18, ID_EDIT_LBL_PATH_MODE);
+            create_ctrl(hwnd, hfont, "COMBOBOX", "", 0,
+                WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32, 68, 114, 288, 100, ID_EDIT_PATH_MODE);
+            create_ctrl(hwnd, hfont, "STATIC", "链接:", 0, 0, 22, 147, 42, 18, ID_EDIT_LBL_LINK);
             create_ctrl(
                 hwnd,
                 hfont,
@@ -384,7 +338,7 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
                 "选文件...",
                 0,
                 WS_TABSTOP | (BS_PUSHBUTTON as u32),
-                200,
+                282,
                 82,
                 74,
                 24,
@@ -411,13 +365,15 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
                 WS_EX_CLIENTEDGE,
                 WS_TABSTOP | (ES_AUTOHSCROLL as u32),
                 68,
-                112,
+                144,
                 288,
                 22,
                 ID_EDIT_PATH,
             );
 
-            create_ctrl(hwnd, hfont, "STATIC", "图标:", 0, 0, 22, 148, 42, 18, ID_EDIT_LBL_ICON);
+            init_edit_target_choices(hwnd, app, ed);
+
+            create_ctrl(hwnd, hfont, "STATIC", "图标:", 0, 0, 22, 180, 42, 18, ID_EDIT_LBL_ICON);
             create_ctrl(
                 hwnd,
                 hfont,
@@ -426,8 +382,8 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
                 WS_EX_CLIENTEDGE,
                 WS_TABSTOP | (ES_AUTOHSCROLL as u32),
                 68,
-                145,
-                206,
+                177,
+                248,
                 22,
                 ID_EDIT_ICON,
             );
@@ -435,22 +391,22 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
                 hwnd,
                 hfont,
                 "BUTTON",
-                "选图标...",
+                "",
                 0,
-                WS_TABSTOP | (BS_PUSHBUTTON as u32),
-                282,
-                144,
-                74,
-                24,
+                WS_TABSTOP | BS_OWNERDRAW as u32,
+                324,
+                172,
+                32,
+                32,
                 ID_EDIT_PICK_ICON,
             );
 
-            create_ctrl(hwnd, hfont, "STATIC", "颜色:", 0, 0, 22, 184, 42, 18, ID_EDIT_LBL_COLOR);
+            create_ctrl(hwnd, hfont, "STATIC", "颜色:", 0, 0, 22, 216, 42, 18, ID_EDIT_LBL_COLOR);
             let color=if ed.use_default_color {String::new()} else {crate::model::format_hex_color(ed.text_color)};
             create_ctrl(hwnd,hfont,"BUTTON",&color,0,WS_TABSTOP|BS_OWNERDRAW as u32,
-                68,181,288,22,ID_EDIT_COLOR_BASE);
+                68,213,288,22,ID_EDIT_COLOR_BASE);
 
-            create_ctrl(hwnd, hfont, "STATIC", "参数:", 0, 0, 22, 218, 42, 18, ID_EDIT_LBL_ARGS);
+            create_ctrl(hwnd, hfont, "STATIC", "参数:", 0, 0, 22, 250, 42, 18, ID_EDIT_LBL_ARGS);
             create_ctrl(
                 hwnd,
                 hfont,
@@ -459,13 +415,13 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
                 WS_EX_CLIENTEDGE,
                 WS_TABSTOP | (ES_AUTOHSCROLL as u32),
                 68,
-                215,
+                247,
                 288,
                 22,
                 ID_EDIT_ARGS,
             );
 
-            create_ctrl(hwnd, hfont, "STATIC", "起始:", 0, 0, 22, 250, 42, 18, ID_EDIT_LBL_DIR);
+            create_ctrl(hwnd, hfont, "STATIC", "起始:", 0, 0, 22, 282, 42, 18, ID_EDIT_LBL_DIR);
             create_ctrl(
                 hwnd,
                 hfont,
@@ -474,13 +430,13 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
                 WS_EX_CLIENTEDGE,
                 WS_TABSTOP | (ES_AUTOHSCROLL as u32),
                 68,
-                247,
+                279,
                 288,
                 22,
                 ID_EDIT_DIR,
             );
 
-            create_ctrl(hwnd, hfont, "STATIC", "热键:", 0, 0, 22, 282, 42, 18, ID_EDIT_LBL_HK);
+            create_ctrl(hwnd, hfont, "STATIC", "热键:", 0, 0, 22, 314, 42, 18, ID_EDIT_LBL_HK);
             create_ctrl(
                 hwnd,
                 hfont,
@@ -489,7 +445,7 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
                 WS_EX_CLIENTEDGE,
                 WS_TABSTOP | (ES_AUTOHSCROLL as u32),
                 68,
-                279,
+                311,
                 288,
                 22,
                 ID_EDIT_HK,
@@ -503,7 +459,7 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
                 0,
                 WS_TABSTOP | (BS_AUTOCHECKBOX as u32),
                 68,
-                312,
+                344,
                 200,
                 20,
                 ID_EDIT_CHK_MIN,
@@ -521,7 +477,7 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
                 24,
                 46,
                 332,
-                288,
+                320,
                 ID_EDIT_REMARK,
             );
 
@@ -533,7 +489,7 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
                 0,
                 WS_TABSTOP | (BS_DEFPUSHBUTTON as u32),
                 206,
-                362,
+                394,
                 78,
                 26,
                 IDOK,
@@ -546,7 +502,7 @@ pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
                 0,
                 WS_TABSTOP | (BS_PUSHBUTTON as u32),
                 292,
-                362,
+                394,
                 78,
                 26,
                 IDCANCEL,
@@ -586,6 +542,94 @@ pub unsafe fn refresh_column_listbox(lb: HWND, cat: &CategoryTab, sel: usize) {
     }
 }
 
+/// 类型与路径方式由用户选择；初始化后不再用链接推断覆盖用户选择。
+unsafe fn init_edit_target_choices(hwnd: HWND, app: &AppState, ed: &EditShortcutDialogState) {
+    let kind = ed.target_kind_hint.unwrap_or_else(|| {
+        if ed.target_path.is_empty() { crate::targets::TargetKind::File }
+        else { crate::targets::TargetKind::infer(&app.base_dir, &ed.target_path) }
+    });
+    for label in ["文件", "文件夹", "系统功能", "网址"] {
+        SendMessageW(GetDlgItem(hwnd, ID_EDIT_KIND), CB_ADDSTRING, 0, to_wide(label).as_ptr() as isize);
+    }
+    if kind == crate::targets::TargetKind::Launcher {
+        SendMessageW(GetDlgItem(hwnd, ID_EDIT_KIND), CB_ADDSTRING, 0, to_wide("启动器功能").as_ptr() as isize);
+    }
+    for label in ["绝对路径", "相对路径"] {
+        SendMessageW(GetDlgItem(hwnd, ID_EDIT_PATH_MODE), CB_ADDSTRING, 0, to_wide(label).as_ptr() as isize);
+    }
+    let relative = if ed.is_new {
+        app.user_cfg.advanced.enabled(crate::advanced::Key::RelativePaths)
+    } else {
+        kind.path_mode(&ed.target_path) == Some(crate::targets::PathMode::Relative)
+    };
+    SendMessageW(GetDlgItem(hwnd, ID_EDIT_PATH_MODE), CB_SETCURSEL, relative as usize, 0);
+    let index = match kind {
+        crate::targets::TargetKind::File => 0, crate::targets::TargetKind::Folder => 1,
+        crate::targets::TargetKind::System => 2, crate::targets::TargetKind::Web => 3,
+        crate::targets::TargetKind::Launcher => 4,
+    };
+    SendMessageW(GetDlgItem(hwnd, ID_EDIT_KIND), CB_SETCURSEL, index, 0);
+}
+
+pub unsafe fn edit_target_kind(hwnd: HWND) -> crate::targets::TargetKind {
+    use crate::targets::TargetKind;
+    match SendMessageW(GetDlgItem(hwnd, ID_EDIT_KIND), CB_GETCURSEL, 0, 0) {
+        1 => TargetKind::Folder,
+        2 => TargetKind::System,
+        3 => TargetKind::Web,
+        4 => TargetKind::Launcher,
+        _ => TargetKind::File,
+    }
+}
+
+pub unsafe fn select_edit_target_kind(hwnd: HWND, kind: crate::targets::TargetKind) {
+    use crate::targets::TargetKind;
+    let index = match kind {
+        TargetKind::File => 0, TargetKind::Folder => 1, TargetKind::System => 2,
+        TargetKind::Web => 3, TargetKind::Launcher => 4,
+    };
+    SendMessageW(GetDlgItem(hwnd, ID_EDIT_KIND), CB_SETCURSEL, index, 0);
+    update_edit_target_controls(hwnd);
+}
+
+/// 系统功能、网址和启动器功能不使用文件路径方式。
+pub unsafe fn update_edit_target_controls(hwnd: HWND) {
+    let enabled = matches!(edit_target_kind(hwnd), crate::targets::TargetKind::File | crate::targets::TargetKind::Folder);
+    for id in [ID_EDIT_LBL_PATH_MODE, ID_EDIT_PATH_MODE] {
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(GetDlgItem(hwnd, id), enabled as i32);
+    }
+    let general = tab_get_cursel(hwnd, ID_EDIT_TAB) == 0;
+    for (id, kind) in [(ID_EDIT_PICK_FILE, crate::targets::TargetKind::File),
+        (ID_EDIT_PICK_DIR, crate::targets::TargetKind::Folder)] {
+        ShowWindow(GetDlgItem(hwnd, id), if general && edit_target_kind(hwnd) == kind { SW_SHOW } else { SW_HIDE });
+    }
+}
+
+/// 路径和起始目录一起转换；转换失败时保留原文，不提交数据。
+pub unsafe fn normalize_edit_paths(hwnd: HWND, base: &std::path::Path) -> bool {
+    use crate::targets::{self, PathMode, TargetKind};
+    if !matches!(edit_target_kind(hwnd), TargetKind::File | TargetKind::Folder) { return true; }
+    let path = get_ctrl_text(hwnd, ID_EDIT_PATH);
+    let start = get_ctrl_text(hwnd, ID_EDIT_DIR);
+    let mode = if SendMessageW(GetDlgItem(hwnd, ID_EDIT_PATH_MODE), CB_GETCURSEL, 0, 0) == 1 {
+        PathMode::Relative
+    } else { PathMode::Absolute };
+    let convert = |value: &str| {
+        if value.trim().is_empty() { Some(String::new()) }
+        else { targets::convert_path(base, value.trim(), mode) }
+    };
+    if let Some((path, start)) = convert(&path).zip(convert(&start)) {
+        set_ctrl_text(hwnd, ID_EDIT_PATH, &path);
+        set_ctrl_text(hwnd, ID_EDIT_DIR, &start);
+        true
+    } else {
+        let relative = TargetKind::File.path_mode(&path) == Some(PathMode::Relative);
+        SendMessageW(GetDlgItem(hwnd, ID_EDIT_PATH_MODE), CB_SETCURSEL, relative as usize, 0);
+        crate::advanced_runtime::message(hwnd, "无法转换路径。相对路径要求目标和起始目录与 KStart 数据根目录位于同一驱动器，请检查路径或选择绝对路径。");
+        false
+    }
+}
+
 pub unsafe fn switch_edit_tab_visibility(hwnd: HWND, active_tab: usize) {
     let show_gen = if active_tab == 0 { SW_SHOW } else { SW_HIDE };
     let show_rem = if active_tab == 1 { SW_SHOW } else { SW_HIDE };
@@ -593,6 +637,10 @@ pub unsafe fn switch_edit_tab_visibility(hwnd: HWND, active_tab: usize) {
         ID_EDIT_ICON_PREVIEW,
         ID_EDIT_LBL_TITLE,
         ID_EDIT_TITLE,
+        ID_EDIT_LBL_KIND,
+        ID_EDIT_KIND,
+        ID_EDIT_LBL_PATH_MODE,
+        ID_EDIT_PATH_MODE,
         ID_EDIT_LBL_LINK,
         ID_EDIT_PICK_FILE,
         ID_EDIT_PICK_DIR,
@@ -686,34 +734,10 @@ pub(crate) unsafe fn blit_surface_on_bg(
 
 /// 绘制原生弹窗中的图像预览与色块（如皮肤缩略图、分类图标、快捷方式图标及 8 色调色板）
 pub unsafe fn paint_native_modal_extras(hwnd: HWND, hdc: HDC, app: &AppState) {
-    let sys_face = crate::advanced_style::PAGE;
-    let bg_rgb = [
-        (sys_face & 0xFF) as u8,
-        ((sys_face >> 8) & 0xFF) as u8,
-        ((sys_face >> 16) & 0xFF) as u8,
-    ];
     SetBkMode(hdc, TRANSPARENT as i32);
 
     match &app.modal {
-        ActiveModal::SkinManager => {
-            let mut client: RECT = std::mem::zeroed();
-            windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
-            let split = crate::dialog_layout::skin_split(hwnd).clamp(120, (client.right-160).max(120));
-            let bar = RECT { left: split-2, top:12, right:split+2, bottom:client.bottom-52 };
-            FillRect(hdc, &bar, windows_sys::Win32::Graphics::Gdi::GetSysColorBrush(
-                windows_sys::Win32::Graphics::Gdi::COLOR_3DSHADOW));
-            if let Some(entry) = app.skins.get(app.selected_skin_index) {
-                let thumb = entry
-                    .preview_gif_path
-                    .as_ref()
-                    .and_then(|p| RgbaSurface::load_file(p));
-                if let Some(surf) = thumb {
-                    let (width, height) = ((client.right-split-22).max(1), (client.bottom-170).max(1));
-                    let resized = surf.resize_to(width as u32, height as u32);
-                    blit_surface_on_bg(hdc, &resized, split+10, 14, width, height, bg_rgb);
-                }
-            }
-        }
+        ActiveModal::SkinManager => { crate::skin_manager::paint_splitter(hwnd, hdc); }
         ActiveModal::CategoryManager { .. } => {}
         ActiveModal::EditShortcut(_) => {}
         _ => {}
@@ -727,23 +751,14 @@ pub unsafe fn commit_edit_shortcut_from_controls(
     ed_state: EditShortcutDialogState,
 ) {
     let title = get_ctrl_text(hwnd, ID_EDIT_TITLE);
-    let mut target_path = get_ctrl_text(hwnd, ID_EDIT_PATH);
+    let target_path = get_ctrl_text(hwnd, ID_EDIT_PATH);
     let icon_key = get_ctrl_text(hwnd, ID_EDIT_ICON);
     let args = get_ctrl_text(hwnd, ID_EDIT_ARGS);
-    let mut work_dir = get_ctrl_text(hwnd, ID_EDIT_DIR);
+    let work_dir = get_ctrl_text(hwnd, ID_EDIT_DIR);
     let hotkey = get_ctrl_text(hwnd, ID_EDIT_HK);
     let remark = get_ctrl_text(hwnd, ID_EDIT_REMARK);
     let min_chk = SendMessageW(GetDlgItem(hwnd, ID_EDIT_CHK_MIN), BM_GETCHECK, 0, 0) != 0;
-    let target_kind = if target_path == ed_state.target_path {
-        ed_state.target_kind_hint.unwrap_or_else(|| crate::targets::TargetKind::infer(&app.base_dir, &target_path))
-    } else {
-        crate::targets::TargetKind::infer(&app.base_dir, &target_path)
-    };
-    if ed_state.is_new && matches!(target_kind, crate::targets::TargetKind::File | crate::targets::TargetKind::Folder)
-        && app.user_cfg.advanced.enabled(crate::advanced::Key::RelativePaths) {
-        target_path = crate::advanced_runtime::relative_target(&app.base_dir, std::path::Path::new(&target_path));
-        work_dir = crate::advanced_runtime::relative_target(&app.base_dir, std::path::Path::new(&work_dir));
-    }
+    let target_kind = edit_target_kind(hwnd);
     if app.user_cfg.advanced.enabled(crate::advanced::Key::WebIcons)
         && crate::advanced_web_icon::is_web_url(&target_path) && ed_state.pending_icon_16.is_none() {
         crate::advanced_web_icon::fetch_for_shortcut(app.base_dir.clone(), target_path.clone(),
@@ -769,12 +784,8 @@ pub unsafe fn commit_edit_shortcut_from_controls(
                 } else {
                     let _ = &mut custom_icon_16;
                 }
-                let final_icon_key = if icon_key.trim().is_empty() {
-                    "app_msedge".to_string()
-                } else {
-                    icon_key.trim().to_string()
-                };
-                grp.items.push(ShortcutItem { use_default_color: ed_state.use_default_color,
+                let final_icon_key = icon_key.trim().to_string();
+                grp.items.push(ShortcutItem { column_added_at: crate::model::next_column_added_at(), use_default_color: ed_state.use_default_color,
                     id: updated_item_id.clone(),
                     category_id: cat.id.clone(),
                     column_id: grp.id.clone(),
@@ -796,7 +807,7 @@ pub unsafe fn commit_edit_shortcut_from_controls(
             if let Some(item) = grp.items.get_mut(ed_state.item_idx) {
                 updated_item_id = item.id.clone();
                 item.name = title;
-                if item.target_path != target_path { item.target_kind = target_kind; }
+                item.target_kind = target_kind;
                 item.target_path = target_path;
                 item.icon_key = icon_key;
                 if let Some(ref ico) = ed_state.pending_icon_16 {

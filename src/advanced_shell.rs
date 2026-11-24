@@ -77,6 +77,23 @@ pub fn url_link(path: &Path) -> Option<String> {
         .filter(|url| !url.is_empty())
 }
 
+/// 导出可由 Windows 独立运行的文件或目录快捷方式。
+pub fn write_file_link(output: &Path, target: &str, args: &str, directory: &str, icon: &str, remark: &str)
+    -> Result<(), Box<dyn std::error::Error>> {
+    let _com = Com::initialize()?;
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+        link.SetPath(PCWSTR(to_wide(target).as_ptr()))?;
+        link.SetArguments(PCWSTR(to_wide(args).as_ptr()))?;
+        link.SetWorkingDirectory(PCWSTR(to_wide(directory).as_ptr()))?;
+        link.SetDescription(PCWSTR(to_wide(remark).as_ptr()))?;
+        if !icon.is_empty() && Path::new(icon).is_file() { link.SetIconLocation(PCWSTR(to_wide(icon).as_ptr()), 0)?; }
+        let persist: IPersistFile = link.cast()?;
+        persist.Save(PCWSTR(wide_path(output).as_ptr()), true)?;
+    }
+    Ok(())
+}
+
 pub fn install_shortcut(root: &Path, desktop: bool) -> Result<(), Box<dyn std::error::Error>> {
     let _com = Com::initialize()?;
     let exe = std::env::current_exe()?;

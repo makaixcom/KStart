@@ -156,7 +156,7 @@ pub unsafe fn logical_mouse(hwnd: HWND, lp: LPARAM, base: (i32, i32)) -> LPARAM 
 }
 
 fn split_limit(split: i32, width: i32) -> i32 {
-    split.clamp(120, (width - 160).max(120))
+    split.clamp(120, (width - 224).max(120))
 }
 unsafe fn arrange(hwnd: HWND, state: &Layout) {
     let size = client(hwnd);
@@ -176,18 +176,8 @@ unsafe fn arrange(hwnd: HWND, state: &Layout) {
         );
     }
     if state.skin {
-        use crate::native_dialogs::{ID_SKIN_APPLY, ID_SKIN_AUTHOR_EDIT, ID_SKIN_LIST};
         let split = split_limit(state.split, w);
-        move_control(GetDlgItem(hwnd, ID_SKIN_LIST), 12, 12, split - 18, h - 64);
-        move_control(
-            GetDlgItem(hwnd, ID_SKIN_AUTHOR_EDIT),
-            split + 6,
-            (h - 146).max(100),
-            w - split - 18,
-            94,
-        );
-        move_control(GetDlgItem(hwnd, ID_SKIN_APPLY), w - 178, h - 40, 78, 26);
-        move_control(GetDlgItem(hwnd, IDCANCEL), w - 90, h - 40, 78, 26);
+        crate::skin_manager::arrange(hwnd, w, h, split);
     }
     move_control(state.grip, w - 15, h - 15, 15, 15);
     InvalidateRect(hwnd, ptr::null(), 1);
@@ -306,7 +296,7 @@ mod tests {
     #[test]
     fn skin_split_keeps_both_panes_visible() {
         assert_eq!(split_limit(-100, 430), 120);
-        assert_eq!(split_limit(999, 430), 270);
+        assert_eq!(split_limit(999, 430), 206);
         assert_eq!(split_limit(400, 800), 400);
     }
 }

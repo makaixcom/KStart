@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+static LAST_COLUMN_ADDED_AT: AtomicU64 = AtomicU64::new(0);
 
 /// 分类数据记录（对应 `user/data.json` 中的 `categories` 数组元素）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +49,9 @@ pub struct ColumnRecord {
 /// 快捷方式数据记录（对应 `user/data.json` 中的 `shortcuts` 数组元素，含 `category_id` 与 `column_id`）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShortcutRecord {
+    /// 进入当前栏目的时间（毫秒）；旧数据缺失时按原显示顺序建立基准。
+    #[serde(default)]
+    pub column_added_at: u64,
     /// 快捷方式唯一 ID（如 `"sc_1"`，用于 `user/config.ini` 的 `[Hotkeys]`）
     pub id: String,
     /// 所属分类 ID
@@ -119,6 +125,46 @@ pub struct AppDataStore {
 #[cfg(test)]
 mod icon_cache_tests {
     use super::*;
+    #[test]
+    fn legacy_membership_order_survives_sort_save_and_reload() {
+        let base=std::env::temp_dir().join(format!("kstart-column-time-{}",std::process::id()));
+        let mut store=AppDataStore::default_store();
+        let legacy=serde_json::to_value(&store).unwrap();
+        let mut legacy=legacy.as_object().unwrap().clone();
+        for item in legacy.get_mut("shortcuts").unwrap().as_array_mut().unwrap(){item.as_object_mut().unwrap().remove("column_added_at");}
+        store=serde_json::from_value(serde_json::Value::Object(legacy)).unwrap();
+        let mut tree=store.build_runtime_tree(&base,&HashMap::new(),&HashMap::new());
+        let original:Vec<_>=tree[0].groups[0].items.iter().map(|item|item.id.clone()).collect();
+        sort_shortcuts(&mut tree[0].groups[0].items,ShortcutSortKey::Title,true);
+        store.sync_from_runtime_tree(&tree,&base);
+        let mut loaded=AppDataStore::load(&base).build_runtime_tree(&base,&HashMap::new(),&HashMap::new());
+        sort_shortcuts(&mut loaded[0].groups[0].items,ShortcutSortKey::ColumnAddedAt,false);
+        assert_eq!(loaded[0].groups[0].items.iter().map(|item|item.id.clone()).collect::<Vec<_>>(),original);
+        let moved=loaded[0].groups[0].items.last_mut().unwrap();
+        let before=moved.column_added_at;
+        moved.enter_column("cat_1","col_2");
+        assert!(moved.column_added_at>before);
+        let first=next_column_added_at();assert!(next_column_added_at()>first);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn title_path_and_membership_sort_both_directions_are_independent() {
+        let tree=AppDataStore::default_store().build_runtime_tree(Path::new("."),&HashMap::new(),&HashMap::new());
+        let mut items=tree[0].groups[0].items[..3].to_vec();
+        for (item,(name,path,time)) in items.iter_mut().zip([("z",r"C:\b.exe",30),("A",r"C:\c.exe",10),("b",r"C:\a.exe",20)]){
+            item.name=name.into();item.target_path=path.into();item.column_added_at=time;
+        }
+        for key in [ShortcutSortKey::Title,ShortcutSortKey::Path,ShortcutSortKey::ColumnAddedAt]{
+            sort_shortcuts(&mut items,key,false);
+            let ascending:Vec<_>=items.iter().map(|item|item.id.clone()).collect();
+            sort_shortcuts(&mut items,key,true);
+            assert_eq!(items.iter().map(|item|item.id.clone()).collect::<Vec<_>>(),ascending.into_iter().rev().collect::<Vec<_>>());
+        }
+        sort_shortcuts(&mut items,ShortcutSortKey::Title,false);assert_eq!(items[0].name,"A");
+        sort_shortcuts(&mut items,ShortcutSortKey::Path,false);assert_eq!(items[0].name,"b");
+        sort_shortcuts(&mut items,ShortcutSortKey::ColumnAddedAt,false);assert_eq!(items[0].name,"A");
+    }
     #[test]
     fn empty_text_color_inherits_default_and_explicit_black_is_preserved() {
         let base=std::env::temp_dir().join(format!("kstart-default-color-audit-{}",std::process::id()));
@@ -221,14 +267,18 @@ impl AppDataStore {
 
                 let items = sc_list
                     .into_iter()
-                    .map(|sc| {
+                    .enumerate()
+                    .map(|(index, sc)| {
                         let custom_icon_16 = custom_icons.get(&sc.icon_key)
                             .or_else(|| custom_icons.get(&sc.id)).cloned().or_else(|| {
                             // 兼容旧版把图标来源路径写入 icon_key 的记录。
                             let path = crate::targets::resolve_path(base_dir, &sc.icon_key);
                             path.is_file().then(|| crate::skin_assets::load_custom_icon_16(&path)).flatten()
                         });
+                        let column_added_at = if sc.column_added_at == 0 { index as u64 + 1 } else { sc.column_added_at };
+                        LAST_COLUMN_ADDED_AT.fetch_max(column_added_at, Ordering::Relaxed);
                         ShortcutItem {
+                            column_added_at,
                             target_kind: sc
                                 .target_kind
                                 .unwrap_or_else(|| TargetKind::infer(base_dir, &sc.target_path)),
@@ -302,6 +352,7 @@ impl AppDataStore {
 
                 for (s_idx, item) in grp.items.iter().enumerate() {
                     self.shortcuts.push(ShortcutRecord {
+                        column_added_at: item.column_added_at,
                         id: item.id.clone(),
                         category_id: cat.id.clone(),
                         column_id: grp.id.clone(),
@@ -393,6 +444,7 @@ impl AppDataStore {
             ],
             shortcuts: vec![
                 ShortcutRecord {
+                    column_added_at: 0,
                     id: "sc_1".to_string(),
                     category_id: "cat_1".to_string(),
                     column_id: "col_1".to_string(),
@@ -410,6 +462,7 @@ impl AppDataStore {
                     sort_order: 1,
                 },
                 ShortcutRecord {
+                    column_added_at: 0,
                     id: "sc_2".to_string(),
                     category_id: "cat_1".to_string(),
                     column_id: "col_1".to_string(),
@@ -427,6 +480,7 @@ impl AppDataStore {
                     sort_order: 2,
                 },
                 ShortcutRecord {
+                    column_added_at: 0,
                     id: "sc_3".to_string(),
                     category_id: "cat_1".to_string(),
                     column_id: "col_1".to_string(),
@@ -444,6 +498,7 @@ impl AppDataStore {
                     sort_order: 3,
                 },
                 ShortcutRecord {
+                    column_added_at: 0,
                     id: "sc_4".to_string(),
                     category_id: "cat_1".to_string(),
                     column_id: "col_1".to_string(),
@@ -461,6 +516,7 @@ impl AppDataStore {
                     sort_order: 4,
                 },
                 ShortcutRecord {
+                    column_added_at: 0,
                     id: "sc_5".to_string(),
                     category_id: "cat_1".to_string(),
                     column_id: "col_1".to_string(),
@@ -478,6 +534,7 @@ impl AppDataStore {
                     sort_order: 5,
                 },
                 ShortcutRecord {
+                    column_added_at: 0,
                     id: "sc_6".to_string(),
                     category_id: "cat_1".to_string(),
                     column_id: "col_1".to_string(),
@@ -495,6 +552,7 @@ impl AppDataStore {
                     sort_order: 6,
                 },
                 ShortcutRecord {
+                    column_added_at: 0,
                     id: "sc_7".to_string(),
                     category_id: "cat_1".to_string(),
                     column_id: "col_1".to_string(),
@@ -512,6 +570,7 @@ impl AppDataStore {
                     sort_order: 7,
                 },
                 ShortcutRecord {
+                    column_added_at: 0,
                     id: "sc_8".to_string(),
                     category_id: "cat_1".to_string(),
                     column_id: "col_1".to_string(),
@@ -529,6 +588,7 @@ impl AppDataStore {
                     sort_order: 8,
                 },
                 ShortcutRecord {
+                    column_added_at: 0,
                     id: "sc_9".to_string(),
                     category_id: "cat_1".to_string(),
                     column_id: "col_1".to_string(),
@@ -553,6 +613,7 @@ impl AppDataStore {
 /// 运行时单个快捷方式项
 #[derive(Debug, Clone)]
 pub struct ShortcutItem {
+    pub column_added_at: u64,
     pub id: String,
     pub category_id: String,
     pub column_id: String,
@@ -567,6 +628,43 @@ pub struct ShortcutItem {
     pub use_default_color: bool,
     pub minimize_on_run: bool,
     pub custom_icon_16: Option<RgbaSurface>,
+}
+
+/// 连续批量加入也拥有严格递增的入栏时间，不受系统时钟回拨影响。
+pub fn next_column_added_at() -> u64 {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
+        .as_millis().min(u64::MAX as u128 - 1) as u64;
+    let mut last = LAST_COLUMN_ADDED_AT.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last.saturating_add(1));
+        match LAST_COLUMN_ADDED_AT.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(observed) => last = observed,
+        }
+    }
+}
+
+impl ShortcutItem {
+    /// 换栏目才重记时间，同栏内手动排序和修改资料保留原时间。
+    pub fn enter_column(&mut self, category: &str, column: &str) {
+        self.category_id = category.into();
+        self.column_id = column.into();
+        self.column_added_at = next_column_added_at();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutSortKey { Title, Path, ColumnAddedAt }
+
+pub fn sort_shortcuts(items: &mut [ShortcutItem], key: ShortcutSortKey, descending: bool) {
+    items.sort_by(|a, b| {
+        let order = match key {
+            ShortcutSortKey::Title => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            ShortcutSortKey::Path => a.target_path.to_lowercase().cmp(&b.target_path.to_lowercase()),
+            ShortcutSortKey::ColumnAddedAt => a.column_added_at.cmp(&b.column_added_at),
+        };
+        if descending { order.reverse() } else { order }
+    });
 }
 
 /// 运行时抽屉式栏目（对应 `ColumnRecord`）
@@ -609,14 +707,13 @@ pub enum MenuAction {
     ExitApp,
 }
 
-/// 内容区空白处右键菜单动作枚举（16 项菜单）
+/// 内容区空白处右键菜单动作枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextMenuAction {
     AddFile,
     AddDirectory,
     AddHyperlink,
     AddSystemFunc,
-    AddAutoLogin,
     CustomAddOrEdit,
     SearchItem,
     SpecificView,
@@ -660,7 +757,6 @@ pub enum MenuIconKind {
     CtxAddDir,
     CtxAddUrl,
     CtxAddSys,
-    CtxAddLogin,
     CtxSearch,
     CtxAppearance,
     CtxPaste,
@@ -790,7 +886,7 @@ pub fn build_popup_menu_items(
     ]
 }
 
-/// 构建内容区右键单击弹出的菜单（1:1 复刻截图 4）
+/// 构建内容区空白处的右键菜单
 pub fn build_context_menu_items() -> Vec<PopupMenuItem<ContextMenuAction>> {
     vec![
         PopupMenuItem {
@@ -818,13 +914,6 @@ pub fn build_context_menu_items() -> Vec<PopupMenuItem<ContextMenuAction>> {
             action: ContextMenuAction::AddSystemFunc,
             label: "添加系统功能(&4)".to_string(),
             icon: MenuIconKind::CtxAddSys,
-            custom_text_color: None,
-            has_separator_below: false,
-        },
-        PopupMenuItem {
-            action: ContextMenuAction::AddAutoLogin,
-            label: "添加自动登录(&5)".to_string(),
-            icon: MenuIconKind::CtxAddLogin,
             custom_text_color: None,
             has_separator_below: false,
         },

@@ -91,6 +91,9 @@ pub struct Runtime {
     inside: bool,
     dock: Option<(RECT, Instant)>,
     dock_hidden: Option<DockEdge>,
+    // 主动唤出后，等待进入窗口或点击外部，再允许靠边收起。
+    dock_waiting_for_interaction: bool,
+    mouse_buttons: u8,
     stretched: Option<(i32, i32)>,
     pub shortcut_scroll: usize,
     pub shortcut_scroll_grab: Option<i32>,
@@ -162,13 +165,53 @@ pub unsafe fn restore_docked(hwnd: HWND) {
     if restore { apply_dock_region(hwnd, None); }
 }
 
+pub unsafe fn hold_docked_open(hwnd: HWND) {
+    let buttons = mouse_buttons();
+    APP_STATE.with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            if let Some(app) = guard.as_mut() {
+                app.advanced_window.dock_waiting_for_interaction = true;
+                app.advanced_window.mouse_buttons = buttons;
+            }
+        }
+    });
+    restore_docked(hwnd);
+}
+
+pub unsafe fn release_dock_on_external_click() {
+    // 失活消息发生在按下鼠标时，补足定时轮询可能漏掉的短促点击。
+    if mouse_buttons() == 0 { return; }
+    APP_STATE.with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            if let Some(app) = guard.as_mut() {
+                app.advanced_window.dock_waiting_for_interaction = false;
+            }
+        }
+    });
+}
+
+impl Runtime {
+    fn update_dock_interaction(&mut self, inside: bool, buttons: u8) {
+        let clicked = buttons & !self.mouse_buttons != 0;
+        self.mouse_buttons = buttons;
+        if inside || clicked {
+            self.dock_waiting_for_interaction = false;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dock_step(state: &mut Runtime, enabled: bool, can_hide: bool, rect: RECT, work: RECT,
     cursor: POINT, hide_delay: Duration, show_delay: Duration, now: Instant) -> Option<Option<DockEdge>> {
     let edge = DockEdge::detect(rect, work);
     if !enabled || !can_hide || edge.is_none() {
         state.dock = None;
+        if !enabled || edge.is_none() { state.dock_waiting_for_interaction = false; }
         return state.dock_hidden.take().map(|_| None);
+    }
+    if state.dock_waiting_for_interaction {
+        state.dock = None;
+        return None;
     }
     if let Some(hidden) = state.dock_hidden {
         if hidden.contains(rect, cursor) {
@@ -199,6 +242,39 @@ fn dock_step(state: &mut Runtime, enabled: bool, can_hide: bool, rect: RECT, wor
 #[cfg(test)]
 mod docking_tests {
     use super::*;
+
+    #[test]
+    fn explicit_activation_waits_for_entry_or_a_new_click_before_hiding() {
+        let work = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+        let rect = RECT { left: 0, top: 100, right: 350, bottom: 700 };
+        let outside = POINT { x: 800, y: 500 };
+        let start = Instant::now();
+        let delay = Duration::from_millis(200);
+        for enter_window in [true, false] {
+            let mut state = Runtime {
+                dock_waiting_for_interaction: true,
+                // 唤出窗口的点击仍按住时，不能被当作下一次点击。
+                mouse_buttons: 1,
+                ..Runtime::default()
+            };
+            for seconds in [0, 1, 60] {
+                state.update_dock_interaction(false, 1);
+                assert_eq!(dock_step(&mut state, true, true, rect, work, outside,
+                    delay, delay, start + Duration::from_secs(seconds)), None);
+                assert!(state.dock_waiting_for_interaction);
+                assert!(state.dock_hidden.is_none());
+            }
+            state.update_dock_interaction(false, 0);
+            assert!(state.dock_waiting_for_interaction);
+            state.update_dock_interaction(enter_window, if enter_window { 0 } else { 2 });
+            assert!(!state.dock_waiting_for_interaction);
+            let now = start + Duration::from_secs(61);
+            assert_eq!(dock_step(&mut state, true, true, rect, work, outside,
+                delay, delay, now), None);
+            assert_eq!(dock_step(&mut state, true, true, rect, work, outside,
+                delay, delay, now + delay), Some(Some(DockEdge::Left)));
+        }
+    }
 
     #[test]
     fn moving_stays_within_monitor_work_area() {
@@ -363,6 +439,7 @@ pub unsafe fn sync_list_visibility(hwnd: HWND) {
 }
 
 pub unsafe fn activate_main(hwnd: HWND) {
+    hold_docked_open(hwnd);
     APP_STATE.with(|cell| { if let Ok(mut guard) = cell.try_borrow_mut() {
         if let Some(app) = guard.as_mut() {
             app.user_cfg.enable_list = true;
@@ -592,6 +669,14 @@ unsafe fn pressed(key: u16) -> bool {
     GetAsyncKeyState(i32::from(key)) < 0
 }
 
+unsafe fn mouse_buttons() -> u8 {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LBUTTON, VK_XBUTTON1, VK_XBUTTON2};
+    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
+        .into_iter().enumerate().fold(0, |mask, (index, key)| {
+            mask | (u8::from(pressed(key)) << index)
+        })
+}
+
 pub unsafe fn tick(hwnd: HWND) {
     let stretch = APP_STATE.with(|cell| {
         let Ok(mut guard) = cell.try_borrow_mut() else { return false; };
@@ -655,6 +740,7 @@ pub unsafe fn tick(hwnd: HWND) {
             return None;
         }
         let state = &mut app.advanced_window;
+        state.update_dock_interaction(inside, mouse_buttons());
         let settings = &app.user_cfg.advanced;
         let indicator_expired = state
             .volume_indicator
