@@ -66,6 +66,8 @@ git push origin v0.1.0
 
 发布新版本时使用新的标签；带连字符的标签（例如 `v0.2.0-beta.1`）会标记为预发布。建议同步更新 `Cargo.toml` 中的版本号并提交 `Cargo.lock`。
 
+Release 正文由 [更新说明脚本](scripts/generate-release-notes.ps1) 自动生成，汇总最近的祖先版本标签到当前标签之间的非合并提交，并附完整比较链接。首个版本汇总全部历史。提交标题使用 `feat: 新增功能`、`fix: 修复问题`（也支持 `bugfix:`）、`perf: 性能优化`、`docs: 文档更新`，会分别归类；支持 `feat(search): 搜索功能` 等作用域。带 `!`（如 `feat!: 调整配置格式`）或正文含 `BREAKING CHANGE:` 的提交单列为不兼容变更。其他提交归入“其他更新”，不会丢失。重跑同一标签的工作流会重新生成正文并更新附件；手动修改的 Release 正文会被覆盖。
+
 也可以在仓库 **Actions → Windows Release → Run workflow** 手动编译：选择普通分支时只生成可下载的构建产物；选择版本标签时会创建或更新该标签的 Release。工作流使用仓库自带的 `GITHUB_TOKEN`，不需要另填个人令牌；仓库或组织需允许 GitHub Actions 及相应的仓库写入权限。
 
 发行包不会包含开发目录里的 `user/`，首次运行会生成默认数据。工作流上传前会运行 [打包脚本](scripts/package-windows.ps1)。
