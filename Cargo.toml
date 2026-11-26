@@ -1,6 +1,6 @@
 [package]
 name = "kstart"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "快速启动 5 (KStart 5) 1:1 像素级复刻版 (Rust)"
 

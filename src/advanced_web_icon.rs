@@ -4,11 +4,8 @@ use crate::{skin_assets::RgbaSurface, to_wide};
 use std::{
     collections::HashSet,
     ffi::c_void,
-    fs,
-    hash::{DefaultHasher, Hash, Hasher},
     io::Cursor,
     mem,
-    path::PathBuf,
     ptr,
     sync::{mpsc, Arc, Mutex, OnceLock},
 };
@@ -28,9 +25,7 @@ static RESULTS: OnceLock<Mutex<Vec<ResultImage>>> = OnceLock::new();
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Request {
-    root: PathBuf,
     url: String,
-    cache: bool,
 }
 
 struct WorkerPool {
@@ -54,7 +49,7 @@ impl WorkerPool {
                     },
                     Err(_) => break,
                 };
-                if let Some(icon) = fetch(&request.root, &request.url, request.cache) {
+                if let Some(icon) = fetch(&request.url) {
                     if let Ok(mut results) = RESULTS.get_or_init(|| Mutex::new(Vec::new())).lock() {
                         results.push((request.url.clone(), icon));
                     }
@@ -97,14 +92,12 @@ mod worker_tests {
             pending: Arc::new(Mutex::new(HashSet::new())),
         };
         let request = Request {
-            root: "first".into(),
             url: "https://example.invalid/a".into(),
-            cache: true,
         };
         pool.enqueue(request.clone());
         pool.enqueue(request.clone());
         let mut other = request.clone();
-        other.root = "second".into();
+        other.url = "https://example.invalid/b".into();
         pool.enqueue(other);
         assert_eq!(receiver.try_iter().count(), 2);
         pool.pending.lock().unwrap().remove(&request);
@@ -135,13 +128,13 @@ pub fn is_web_url(url: &str) -> bool {
     })
 }
 
-pub fn fetch_for_shortcut(root: PathBuf, url: String, cache: bool) {
+pub fn fetch_for_shortcut(url: String) {
     if !is_web_url(&url) {
         return;
     }
     WORKERS
         .get_or_init(WorkerPool::new)
-        .enqueue(Request { root, url, cache });
+        .enqueue(Request { url });
 }
 
 pub fn take_results() -> Vec<ResultImage> {
@@ -152,7 +145,7 @@ pub fn take_results() -> Vec<ResultImage> {
         .unwrap_or_default()
 }
 
-fn fetch(root: &std::path::Path, url: &str, cache: bool) -> Option<RgbaSurface> {
+fn fetch(url: &str) -> Option<RgbaSurface> {
     let wide = to_wide(url);
     let (host, port, secure) = unsafe {
         let mut info: URL_COMPONENTS = mem::zeroed();
@@ -177,20 +170,8 @@ fn fetch(root: &std::path::Path, url: &str, cache: bool) -> Option<RgbaSurface> 
             info.nScheme == WINHTTP_INTERNET_SCHEME_HTTPS,
         )
     };
-    let mut hash = DefaultHasher::new();
-    (&host, port, secure).hash(&mut hash);
-    let dir = root.join("user/icon-cache");
-    let path = dir.join(format!("web-{:016x}.png", hash.finish()));
-    if cache {
-        if let Some(icon) = RgbaSurface::load_file(&path) {
-            return Some(icon);
-        }
-    }
     let data = unsafe { download(&host, port, secure)? };
     let icon = decode_icon(&data, 16)?;
-    if cache && fs::create_dir_all(dir).is_ok() {
-        let _ = icon.save_png(&path);
-    }
     Some(icon)
 }
 

@@ -1,4 +1,4 @@
-//! 栏目右键菜单的排序、标题编辑和批量导入导出窗口。
+//! 栏目新建、右键菜单的排序、标题编辑和批量导入导出窗口。
 use crate::{
     advanced::AdvancedSettings,
     model::{self, ShortcutGroup, ShortcutItem, ShortcutSortKey},
@@ -55,6 +55,8 @@ const ASCENDING: i32 = 1833;
 const DESCENDING: i32 = 1834;
 const MIN_YES: i32 = 1835;
 const MIN_NO: i32 = 1836;
+const NORMAL_COLUMN: i32 = 1840;
+const FOLDER_COLUMN: i32 = 1841;
 
 #[derive(Clone, Copy)]
 pub enum Action {
@@ -81,6 +83,7 @@ enum Dialog {
         descending: bool,
     },
     Rename(String),
+    Create(String),
     Paths {
         before: String,
         after: String,
@@ -93,6 +96,48 @@ struct State {
     dialog: RefCell<Dialog>,
     size: (i32, i32),
     font: HFONT,
+}
+
+/// 普通栏目仅在确认后创建；对话框期间不占用全局状态借用。
+pub unsafe fn create_column(owner: HWND, category: usize) {
+    let category_id = APP_STATE.with(|cell| {
+        let guard = cell.try_borrow().ok()?;
+        Some(guard.as_ref()?.categories.get(category)?.id.clone())
+    });
+    let Some(category_id) = category_id else {
+        return;
+    };
+    let Some(Dialog::Create(title)) = show(
+        owner,
+        "添加栏目",
+        (372, 228),
+        Dialog::Create("新建栏目".into()),
+    ) else {
+        return;
+    };
+    let created = APP_STATE.with(|cell| {
+        let mut guard = cell.try_borrow_mut().ok()?;
+        let app = guard.as_mut()?;
+        let category = app
+            .categories
+            .iter()
+            .position(|cat| cat.id == category_id)?;
+        app.append_column(category, title)?;
+        app.active_category = category;
+        app.selected_shortcuts.clear();
+        app.dragging_shortcut = None;
+        app.marquee_rect = None;
+        app.hover_target = crate::renderer::HitTarget::None;
+        app.down_target = crate::renderer::HitTarget::None;
+        app.advanced_window.shortcut_scroll = 0;
+        app.persist_data();
+        Some(())
+    });
+    if created.is_some() {
+        InvalidateRect(owner, ptr::null(), 0);
+    } else {
+        notify(owner, "目标类别已不存在，栏目未添加。");
+    }
 }
 
 /// 只在 APP_STATE 借用释放后进入窗口的模态消息循环。
@@ -334,6 +379,47 @@ unsafe fn populate(hwnd: HWND, state: &State) {
                 radio(hwnd, font, "降序", 156, 108, 70, DESCENDING, false, false);
                 button(hwnd, font, "确定", 114, 168, 72, 21, IDOK);
                 button(hwnd, font, "取消", 194, 168, 72, 21, IDCANCEL);
+            }
+            Dialog::Create(value) => {
+                radio(
+                    hwnd,
+                    font,
+                    "普通栏目",
+                    26,
+                    24,
+                    98,
+                    NORMAL_COLUMN,
+                    true,
+                    true,
+                );
+                radio(
+                    hwnd,
+                    font,
+                    "文件夹/网址栏目",
+                    132,
+                    24,
+                    170,
+                    FOLDER_COLUMN,
+                    false,
+                    false,
+                );
+                EnableWindow(GetDlgItem(hwnd, FOLDER_COLUMN), 0);
+                label(hwnd, font, "栏目标题：", 26, 66, 300, -1);
+                ctrl(
+                    hwnd,
+                    font,
+                    "EDIT",
+                    value,
+                    WS_EX_CLIENTEDGE,
+                    WS_TABSTOP | ES_AUTOHSCROLL as u32,
+                    42,
+                    90,
+                    290,
+                    20,
+                    TITLE,
+                );
+                button(hwnd, font, "确定", 202, 194, 72, 21, IDOK);
+                button(hwnd, font, "取消", 282, 194, 72, 21, IDCANCEL);
             }
             Dialog::Rename(value) => {
                 label(hwnd, font, "请输入新的栏目标题:", 14, 14, 290, -1);
@@ -926,15 +1012,6 @@ unsafe fn batch_command(hwnd: HWND, id: i32, notification: u32) {
             };
             for (offset, item) in imported.iter_mut().enumerate() {
                 item.id = format!("sc_{}", first as u64 + offset as u64);
-                if let Some(icon) = &item.custom_icon_16 {
-                    let directory = base.join("user/icons");
-                    if std::fs::create_dir_all(&directory).is_err()
-                        || !icon.save_png(&directory.join(format!("{}.png", item.id)))
-                    {
-                        notify(hwnd, "无法保存导入的图标，尚未添加快捷方式。");
-                        return;
-                    }
-                }
             }
             let updated = mutate(&column, |group| {
                 for mut item in imported {
@@ -1051,15 +1128,6 @@ unsafe fn batch_command(hwnd: HWND, id: i32, notification: u32) {
                 notify(hwnd, "无法读取所选图标。");
                 return;
             };
-            let directory = base.join("user/icons");
-            if std::fs::create_dir_all(&directory).is_err()
-                || chosen
-                    .iter()
-                    .any(|item| !icon.save_png(&directory.join(format!("{}.png", item.id))))
-            {
-                notify(hwnd, "无法保存图标。");
-                return;
-            }
             mutate(&column, |group| {
                 for item in &mut group.items {
                     if ids.contains(&item.id) {
@@ -1288,7 +1356,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             return 1;
         }
         if id == IDOK {
-            let value = get_ctrl_text(hwnd, TITLE).trim().to_string();
+            let value = get_ctrl_text(hwnd, TITLE);
             let before = get_ctrl_text(hwnd, BEFORE).trim().to_string();
             let after = get_ctrl_text(hwnd, AFTER).trim().to_string();
             let mut error = None;
@@ -1310,8 +1378,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         *descending =
                             SendMessageW(GetDlgItem(hwnd, DESCENDING), BM_GETCHECK, 0, 0) != 0;
                     }
-                    Dialog::Rename(title) => {
-                        if value.is_empty() {
+                    Dialog::Rename(title) | Dialog::Create(title) => {
+                        if value.trim().is_empty() {
                             error = Some("栏目标题不能为空。");
                         } else {
                             *title = value;
@@ -1344,4 +1412,206 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
     }
     0
+}
+
+#[cfg(test)]
+mod create_tests {
+    use super::*;
+    use crate::{
+        dialog_tests::{capture, enable, queue},
+        renderer::{ActivePopupMenu, HitTarget},
+        skin_parser::ToolButtonKind,
+        AppState,
+    };
+    unsafe fn click_add(owner: HWND, x: i32, y: i32) {
+        let position = (x & 0xffff) as isize | (((y & 0xffff) as isize) << 16);
+        crate::main_wnd_proc(owner, WM_LBUTTONDOWN, 1, position);
+        crate::main_wnd_proc(owner, WM_LBUTTONUP, 0, position);
+    }
+    #[test]
+    fn create_column_button_commits_only_after_confirmation_when_requested() {
+        let Some(base) = std::env::var_os("KSTART_CREATE_COLUMN_UI_BASE") else {
+            return;
+        };
+        let base = PathBuf::from(base);
+        let shots = base.join("shots");
+        std::fs::create_dir_all(&shots).unwrap();
+        let mut app = AppState::new(base.clone(), ActivePopupMenu::None).unwrap();
+        app.persist_data();
+        app.selected_shortcuts.insert(0);
+        app.advanced_window.shortcut_scroll = 2;
+        let before = std::fs::read(base.join("user/data.json")).unwrap();
+        let count = app.categories[0].groups.len();
+        let other = app.categories[1].groups.len();
+        let category = app.categories[0].id.clone();
+        let button = app
+            .skin_cfg
+            .tool_buttons
+            .iter()
+            .find(|button| button.kind == ToolButtonKind::FolderLock)
+            .unwrap();
+        let x = button
+            .left
+            .resolve(app.user_cfg.window_width, app.user_cfg.window_height)
+            + 2;
+        let y = button
+            .top
+            .resolve(app.user_cfg.window_width, app.user_cfg.window_height)
+            + 2;
+        assert_eq!(
+            crate::renderer::hit_test_main(
+                x,
+                y,
+                app.user_cfg.window_width,
+                app.user_cfg.window_height,
+                &app.skin_cfg,
+                &app.skin_assets,
+                &app.categories,
+                0,
+                &app.user_cfg.advanced,
+                0
+            ),
+            HitTarget::ToolButton(ToolButtonKind::FolderLock)
+        );
+        unsafe {
+            let owner = CreateWindowExW(
+                0,
+                to_wide("STATIC").as_ptr(),
+                to_wide("KStart 栏目测试").as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                app.user_cfg.window_width,
+                app.user_cfg.window_height,
+                0,
+                0,
+                GetModuleHandleW(ptr::null()),
+                ptr::null(),
+            );
+            assert_ne!(owner, 0);
+            app.main_hwnd = owner;
+            APP_STATE.with(|cell| *cell.try_borrow_mut().unwrap() = Some(app));
+            enable(true);
+            let shot = shots.join("column-create.png");
+            queue(move |hwnd| {
+                assert_eq!(get_ctrl_text(hwnd, TITLE), "新建栏目");
+                assert_eq!(
+                    SendMessageW(GetDlgItem(hwnd, NORMAL_COLUMN), BM_GETCHECK, 0, 0),
+                    1
+                );
+                assert_eq!(
+                    windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(GetDlgItem(
+                        hwnd,
+                        FOLDER_COLUMN
+                    )),
+                    0
+                );
+                let selection = SendMessageW(GetDlgItem(hwnd, TITLE), EM_GETSEL, 0, 0) as u32;
+                assert_eq!(selection & 0xffff, 0);
+                assert_eq!(selection >> 16, 4);
+                capture(hwnd, &shot);
+                set_ctrl_text(hwnd, TITLE, "取消后不得新增");
+                SendMessageW(hwnd, WM_COMMAND, IDCANCEL as usize, 0);
+            });
+            click_add(owner, x, y);
+            assert_eq!(std::fs::read(base.join("user/data.json")).unwrap(), before);
+            queue(move |hwnd| {
+                set_ctrl_text(hwnd, TITLE, "   ");
+                SendMessageW(hwnd, WM_COMMAND, IDOK as usize, 0);
+                assert_ne!(IsWindow(hwnd), 0);
+                APP_STATE.with(|cell| {
+                    assert_eq!(
+                        cell.try_borrow().unwrap().as_ref().unwrap().categories[0]
+                            .groups
+                            .len(),
+                        count
+                    )
+                });
+                set_ctrl_text(hwnd, TITLE, "  工作资料  ");
+                SendMessageW(hwnd, WM_COMMAND, IDOK as usize, 0);
+            });
+            click_add(owner, x, y);
+            APP_STATE.with(|cell| {
+                let guard = cell.try_borrow().unwrap();
+                let app = guard.as_ref().unwrap();
+                assert_eq!(app.categories[0].groups.len(), count + 1);
+                assert_eq!(app.categories[0].active_group_index, count);
+                assert_eq!(app.categories[0].groups[count].title, "  工作资料  ");
+                assert!(app.categories[0].groups[count].items.is_empty());
+                assert!(app.selected_shortcuts.is_empty());
+                assert_eq!(app.advanced_window.shortcut_scroll, 0);
+                assert_eq!(app.categories[1].groups.len(), other);
+            });
+            let saved = crate::model::AppDataStore::load(&base);
+            assert!(saved
+                .columns
+                .iter()
+                .any(|column| column.category_id == category && column.name == "  工作资料  "));
+            APP_STATE.with(|cell| {
+                let mut guard = cell.try_borrow_mut().unwrap();
+                let app = guard.as_mut().unwrap();
+                app.categories[0].groups[count].title = "-= 新建项目 =-".into();
+                app.persist_data();
+            });
+            let shot = shots.join("column-rename-literal.png");
+            queue(move |hwnd| {
+                assert_eq!(get_ctrl_text(hwnd, TITLE), "-= 新建项目 =-");
+                capture(hwnd, &shot);
+                set_ctrl_text(hwnd, TITLE, "  -= 修改后的项目 =-  ");
+                SendMessageW(hwnd, WM_COMMAND, IDOK as usize, 0);
+            });
+            open(owner, 0, count, Action::Rename);
+            let saved = crate::model::AppDataStore::load(&base);
+            assert!(saved
+                .columns
+                .iter()
+                .any(|column| column.category_id == category
+                    && column.name == "  -= 修改后的项目 =-  "));
+            let tree = saved.build_runtime_tree(&base, &Default::default(), &Default::default());
+            assert_eq!(tree[0].groups[count].title, "  -= 修改后的项目 =-  ");
+            APP_STATE.with(|cell| {
+                let mut guard = cell.try_borrow_mut().unwrap();
+                let app = guard.as_mut().unwrap();
+                app.categories[0].groups.clear();
+                app.categories[0].active_group_index = 0;
+                app.persist_data();
+            });
+            queue(|hwnd| {
+                SendMessageW(hwnd, WM_COMMAND, IDOK as usize, 0);
+            });
+            click_add(owner, x, y);
+            APP_STATE.with(|cell| {
+                let guard = cell.try_borrow().unwrap();
+                let app = guard.as_ref().unwrap();
+                assert_eq!(app.categories[0].groups.len(), 1);
+                assert_eq!(app.categories[0].groups[0].title, "新建栏目");
+                let ids = app
+                    .categories
+                    .iter()
+                    .flat_map(|cat| &cat.groups)
+                    .map(|group| &group.id)
+                    .collect::<HashSet<_>>();
+                assert_eq!(
+                    ids.len(),
+                    app.categories
+                        .iter()
+                        .map(|cat| cat.groups.len())
+                        .sum::<usize>()
+                );
+            });
+            let before = std::fs::read(base.join("user/data.json")).unwrap();
+            queue(|hwnd| {
+                SendMessageW(hwnd, WM_CLOSE, 0, 0);
+            });
+            click_add(owner, x, y);
+            assert_eq!(std::fs::read(base.join("user/data.json")).unwrap(), before);
+            enable(false);
+            DestroyWindow(owner);
+        }
+        assert!(!base.join("user/icons").exists());
+        assert!(!base.join("user/icon-cache").exists());
+        APP_STATE.with(|cell| {
+            cell.try_borrow_mut().unwrap().take();
+        });
+    }
 }

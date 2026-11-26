@@ -3,6 +3,7 @@ use std::{env, fs, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-changed=icons/app.ico");
     println!("cargo:rerun-if-changed=icons/app.rc");
+    println!("cargo:rerun-if-changed=icons/app.manifest");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") { return; }
     let mut candidates = Vec::new();
     if let Some(path) = env::var_os("RC") { candidates.push(PathBuf::from(path)); }

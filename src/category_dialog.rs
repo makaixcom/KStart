@@ -12,7 +12,7 @@ pub unsafe fn populate(hwnd: HWND, font: HFONT, app: &AppState, selected: usize)
     for (index, (label, id)) in [("新建", ID_CAT_BTN_NEW), ("删除", ID_CAT_BTN_DEL),
         ("改名", ID_CAT_BTN_RENAME), ("加密", ID_CAT_BTN_ENC),
         ("上移", ID_CAT_BTN_UP), ("下移", ID_CAT_BTN_DOWN)].into_iter().enumerate() {
-        create_ctrl(hwnd, font, "BUTTON", label, 0, WS_TABSTOP | BS_OWNERDRAW as u32,
+        create_ctrl(hwnd, font, "BUTTON", label, 0, WS_TABSTOP,
             18 + index as i32 * 64, 16, 64, 23, id);
     }
     let list = create_ctrl(hwnd, font, "LISTBOX", "", WS_EX_CLIENTEDGE,
@@ -147,19 +147,8 @@ pub unsafe fn pick(owner: HWND, index: usize) {
 pub unsafe fn add(owner: HWND, index: usize) {
     let Some(source) = crate::pick_file_dialog(owner, "增加类别图标", &[("图标与图片", "*.ico;*.png;*.bmp;*.gif")]) else { return; };
     let Some(image) = RgbaSurface::load_file(&source) else { return; };
-    let root = crate::APP_STATE.with(|cell| cell.try_borrow().ok()
-        .and_then(|guard| guard.as_ref().map(|app| app.base_dir.clone())));
-    let Some(root) = root else { return; };
-    let directory = root.join("icons/small");
-    if std::fs::create_dir_all(&directory).is_err() { return; }
-    let stem = source.file_stem().unwrap_or_default().to_string_lossy();
-    let mut name = format!("{}.png", stem);
-    let mut serial = 1;
-    while directory.join(&name).exists() { name = format!("{}_{}.png", stem, serial); serial += 1; }
-    let image = image.resize_to(16, 16);
-    if image.save_png(&directory.join(&name)) {
-        apply_selection(owner, index, format!("icons/small/{}", name), Some(image));
-    }
+
+    apply_selection(owner, index, source.to_string_lossy().into_owned(), Some(image.resize_to(16, 16)));
 }
 
 pub unsafe fn manage(owner: HWND) {

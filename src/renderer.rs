@@ -121,6 +121,8 @@ pub enum ActiveModal {
     },
     /// 热键管理与设置热键窗口
     HotkeyManager(Option<String>),
+    /// 计划任务管理与单条快捷方式的计划设置。
+    ScheduleManager(Option<String>),
     /// 修改快捷方式窗口（含常规与备注 Tab）
     EditShortcut(EditShortcutDialogState),
     /// 快捷方式搜索结果窗口
@@ -139,6 +141,7 @@ impl ActiveModal {
             ActiveModal::CategoryManager { .. } => (380, 405),
             ActiveModal::ColumnSort { .. } => (360, 355),
             ActiveModal::HotkeyManager(_) => (420, 440),
+            ActiveModal::ScheduleManager(_) => (540, 500),
             ActiveModal::EditShortcut(_) => (371, 458),
             ActiveModal::Search(_) | ActiveModal::Advanced(_) => (0, 0),
             ActiveModal::About => (522, 429),
@@ -234,7 +237,6 @@ pub struct RenderState<'a> {
     pub down_target: HitTarget,
     pub time_string: &'a str,
     pub search_query: &'a str,
-    pub search_focused: bool,
     pub list_background: Option<&'a RgbaSurface>,
     pub shortcut_scroll: usize,
     pub volume_level: Option<u8>,
@@ -497,7 +499,7 @@ mod spacing_tests {
                     builtin_icons: &builtin, user_cfg: &user, categories: &categories,
                     active_category: active, hover_target: HitTarget::None,
                     down_target: HitTarget::None, time_string: "", search_query: "",
-                    search_focused: false, list_background: None, shortcut_scroll: 0,
+                    list_background: None, shortcut_scroll: 0,
                     volume_level: None, tooltip: None, popup_menu: ActivePopupMenu::None,
                     menu_scroll: 0, skins: &[], active_skin_index: 0, selected_skin_index: 0,
                     dragging_shortcut: None, marquee_rect: None, selected_shortcuts: &selection,
@@ -953,7 +955,7 @@ pub fn hit_test_modal(
             }
             HitTarget::None
         }
-        ActiveModal::None | ActiveModal::Search(_) | ActiveModal::Advanced(_) => HitTarget::None,
+        ActiveModal::None | ActiveModal::ScheduleManager(_) | ActiveModal::Search(_) | ActiveModal::Advanced(_) => HitTarget::None,
     }
 }
 
@@ -1153,7 +1155,7 @@ pub fn render_main_frame(
                 }
 
                 texts.push(TextDrawCmd {
-                    text: format!("-= {} =-", grp.title),
+                    text: grp.title.clone(),
                     x: gx,
                     y: gy + 1,
                     w: gw,
@@ -1276,42 +1278,39 @@ pub fn render_main_frame(
                     );
                 }
 
-                // 正在拖拽快捷方式：跟随鼠标绘制半透明预览框
+                // 拖拽预览直接绘制图标和名称，蓝色虚线框不填充背景。
                 if let Some((drag_idx, dmx, dmy)) = state.dragging_shortcut {
                     if let Some(item) = group.items.get(drag_idx) {
-                        canvas.fill_rect_alpha(
-                            dmx - 8,
-                            dmy - 8,
-                            120,
-                            20,
-                            cfg.menu_colors.item_hover_bg_color,
-                            190,
-                        );
-                        canvas.stroke_rect(
-                            dmx - 8,
-                            dmy - 8,
-                            120,
-                            20,
-                            cfg.menu_colors.item_border_color,
-                        );
-                        if let Some(custom_ico) = &item.custom_icon_16 {
-                            canvas.blit_stretch(custom_ico, dmx - 6, dmy - 6, 16, 16);
-                        } else if let Some(ico) = builtin.app_icons.get(&item.icon_key) {
-                            canvas.blit(ico, dmx - 6, dmy - 6);
+                        let (_, _, _, preview_w, preview_h) = compute_visible_shortcut_rects(
+                            cfg, w, h, cat, settings, state.shortcut_scroll,
+                        ).into_iter().find(|(idx, ..)| *idx == drag_idx)
+                            .unwrap_or((drag_idx, 0, 0, 120, icon_size + 4));
+                        let x = dmx - 8;
+                        let y = dmy - 8;
+                        let below = icon_size == 32 && !settings.enabled(Setting::TitleRight);
+                        let icon_x = if below { x + (preview_w - icon_size) / 2 } else { x + 2 };
+                        let icon_y = y + 2;
+                        canvas.stroke_dashed_rect(x, y, preview_w, preview_h, RgbColor::new(0, 160, 255));
+                        if let Some(icon) = item.custom_icon_16.as_ref().or_else(|| builtin.app_icons.get(&item.icon_key)) {
+                            canvas.blit(&icon.resize_to(icon_size as u32, icon_size as u32), icon_x, icon_y);
                         }
-                        texts.push(TextDrawCmd {
-                            text: item.name.clone(),
-                            x: dmx + 14,
-                            y: dmy - 6,
-                            w: 96,
-                            h: 16,
-                            color: item.text_color,
-                            bold: false,
-                            align: TextAlign::Left,
-                            mnemonic: false,
-                            multiline: false,
-                            font_slot: None,
-                        });
+                        if show_title {
+                            texts.push(TextDrawCmd {
+                                text: item.name.clone(),
+                                x: if below { x + 2 } else { icon_x + icon_size + 4 },
+                                y: if below { icon_y + icon_size + 4 } else { icon_y + (icon_size - 14) / 2 },
+                                w: if below { preview_w - 4 } else { (preview_w - icon_size - 8).max(0) },
+                                h: 15,
+                                color: if item.use_default_color {
+                                    crate::advanced::color(settings.text(Setting::DefaultColor)).unwrap_or(RgbColor::new(0, 0, 0))
+                                } else { item.text_color },
+                                bold: false,
+                                align: if below { TextAlign::Center } else { TextAlign::Left },
+                                mnemonic: false,
+                                multiline: false,
+                                font_slot: Some(0),
+                            });
+                        }
                     }
                 }
             }
@@ -1374,12 +1373,9 @@ pub fn render_main_frame(
             );
         }
 
-        if !state.search_query.is_empty() || state.search_focused {
-            let display_str = if state.search_focused {
-                format!("{}|", state.search_query)
-            } else {
-                state.search_query.to_string()
-            };
+        // 离线预览保留查询文字，运行时文字与光标由原生文本框绘制。
+        if !state.search_query.is_empty() {
+            let display_str = state.search_query.to_string();
             texts.push(TextDrawCmd {
                 text: display_str,
                 x: sx + 2,
@@ -1866,7 +1862,7 @@ pub fn render_modal_window_frame(
             render_edit_shortcut_dialog(ctx, dw, dh, canvas, &mut texts, ed)
         }
         ActiveModal::About => render_about_dialog(ctx, dw, dh, canvas, &mut texts),
-        ActiveModal::None | ActiveModal::Search(_) | ActiveModal::Advanced(_) => {}
+        ActiveModal::None | ActiveModal::ScheduleManager(_) | ActiveModal::Search(_) | ActiveModal::Advanced(_) => {}
     }
 
     texts
@@ -2000,12 +1996,12 @@ fn render_about_dialog(
         ctx.hover_target == HitTarget::AboutClose,
     );
 
-    // 1. 左侧橙黄渐变横幅 (x=1, y=24, 137x360)
+    // 1. 左侧竖幅插画 (x=1, y=24, 137x360)
     canvas.blit(&ctx.builtin_icons.about_banner, 1, 24);
 
     // 2. 右侧版本与版权文本
     texts.push(TextDrawCmd {
-        text: "版本号: 5.1 Build 2012.8.20".to_string(),
+        text: format!("版本号: v{}", env!("CARGO_PKG_VERSION")),
         x: 152,
         y: 38,
         w: 240,
@@ -2376,7 +2372,7 @@ fn render_column_sort_dialog(
             canvas.fill_rect(list_x + 8, ry + 6, 4, 10, RgbColor::new(0x65, 0x88, 0xBA));
 
             texts.push(TextDrawCmd {
-                text: format!("({})-= {} =-", i + 1, grp.title),
+                text: format!("({}){}", i + 1, grp.title),
                 x: list_x + 26,
                 y: ry + 1,
                 w: list_w - 32,

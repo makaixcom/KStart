@@ -85,6 +85,7 @@ pub const ID_EDIT_COLOR_BASE: i32 = 1450; // 统一文字颜色选择器
 pub fn native_modal_client_info(modal: &ActiveModal) -> (i32, i32, &'static str) {
     match modal {
         ActiveModal::Advanced(_) => (crate::advanced_dialog::WIDTH, crate::advanced_dialog::HEIGHT, "高级设置"),
+        ActiveModal::About => (522, 405, "关于快速启动"),
         ActiveModal::SkinManager => (760, 680, "皮肤管理器"),
         ActiveModal::CategoryManager { .. } => (410, 438, "类别管理"),
         ActiveModal::ColumnSort { .. } => (350, 320, "栏目排序"),
@@ -114,15 +115,7 @@ pub(crate) unsafe fn create_ctrl(
     h: i32,
     id: i32,
 ) -> HWND {
-    let ctrl = create_classic_ctrl(parent, hfont, cls, text, ex_style, style, x, y, w, h, id);
-    if cls.eq_ignore_ascii_case("BUTTON") {
-        let kind = style & 0xf;
-        if kind <= BS_AUTOCHECKBOX as u32 {
-            crate::advanced_style::button(ctrl, kind == BS_AUTOCHECKBOX as u32 || kind == 2,
-                id == IDOK);
-        }
-    }
-    ctrl
+    create_classic_ctrl(parent, hfont, cls, text, ex_style, style, x, y, w, h, id)
 }
 
 /// 经典对话框保留系统原生按钮，与旧版管理界面的布局和交互一致。
@@ -150,7 +143,47 @@ pub(crate) unsafe fn create_classic_ctrl(
     if ctrl != 0 && hfont != 0 {
         SendMessageW(ctrl, WM_SETFONT, hfont as usize, 1);
     }
+    if ctrl != 0 && cls.eq_ignore_ascii_case("EDIT") {
+        windows_sys::Win32::UI::Shell::SetWindowSubclass(ctrl, Some(edit_proc), 0x4b5345, 0);
+    }
+    if ["EDIT", "LISTBOX", "SysListView32"].iter().any(|class| cls.eq_ignore_ascii_case(class)) {
+        crate::dialog_scrollbars::install(ctrl);
+    }
+    if ctrl != 0 && cls.eq_ignore_ascii_case("COMBOBOX") {
+        use windows_sys::Win32::UI::Controls::{COMBOBOXINFO, GetComboBoxInfo};
+        let mut info: COMBOBOXINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<COMBOBOXINFO>() as u32;
+        if GetComboBoxInfo(ctrl, &mut info) != 0 {
+            crate::dialog_scrollbars::install(info.hwndList);
+        }
+    }
     ctrl
+}
+
+/// 补充标准 EDIT 的全选快捷键，其余编辑、撤销、剪贴板和输入法均由系统处理。
+unsafe extern "system" fn edit_proc(
+    hwnd: HWND, message: u32, wp: usize, lp: isize, id: usize, _: usize,
+) -> isize {
+    use windows_sys::Win32::UI::{
+        Controls::EM_SETSEL,
+        Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU},
+        Shell::{DefSubclassProc, RemoveWindowSubclass},
+        WindowsAndMessaging::{WM_CHAR, WM_KEYDOWN, WM_NCDESTROY},
+    };
+    if message == WM_NCDESTROY {
+        RemoveWindowSubclass(hwnd, Some(edit_proc), id);
+    }
+    if message == WM_KEYDOWN && wp == b'A' as usize
+        && GetKeyState(VK_CONTROL as i32) < 0 && GetKeyState(VK_MENU as i32) >= 0
+    {
+        SendMessageW(hwnd, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    if message == WM_CHAR && wp == 1 {
+        SendMessageW(hwnd, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    DefSubclassProc(hwnd, message, wp, lp)
 }
 
 /// 读取控件文本
@@ -186,6 +219,7 @@ unsafe fn listbox_add(lb: HWND, text: &str) {
 /// 在原生窗口上创建对应弹窗的全部子控件
 pub unsafe fn populate_native_dialog(hwnd: HWND, hfont: HFONT, app: &AppState) {
     match &app.modal {
+        ActiveModal::About => crate::about_dialog::populate(hwnd, hfont),
         ActiveModal::SkinManager => { crate::skin_manager::populate(hwnd, hfont, app); }
 
         ActiveModal::CategoryManager { selected_idx, .. } => {
@@ -761,13 +795,13 @@ pub unsafe fn commit_edit_shortcut_from_controls(
     let target_kind = edit_target_kind(hwnd);
     if app.user_cfg.advanced.enabled(crate::advanced::Key::WebIcons)
         && crate::advanced_web_icon::is_web_url(&target_path) && ed_state.pending_icon_16.is_none() {
-        crate::advanced_web_icon::fetch_for_shortcut(app.base_dir.clone(), target_path.clone(),
-            app.user_cfg.advanced.enabled(crate::advanced::Key::CacheWebIcons));
+        crate::advanced_web_icon::fetch_for_shortcut(target_path.clone());
     }
 
     let mut updated_item_id = ed_state.shortcut_id.clone();
 
     if ed_state.is_new {
+        let _ = app.ensure_column(ed_state.cat_idx, ed_state.grp_idx);
         if let Some(cat) = app.categories.get_mut(ed_state.cat_idx) {
             let grp_idx = ed_state.grp_idx.min(cat.groups.len().saturating_sub(1));
             if let Some(grp) = cat.groups.get_mut(grp_idx) {
@@ -776,14 +810,7 @@ pub unsafe fn commit_edit_shortcut_from_controls(
                 } else {
                     title.trim().to_string()
                 };
-                let mut custom_icon_16 = ed_state.pending_icon_16.clone();
-                if let Some(ref ico) = custom_icon_16 {
-                    let icon_dir = app.base_dir.join("user").join("icons");
-                    let _ = std::fs::create_dir_all(&icon_dir);
-                    let _ = ico.save_png(&icon_dir.join(format!("{}.png", updated_item_id)));
-                } else {
-                    let _ = &mut custom_icon_16;
-                }
+                let custom_icon_16 = ed_state.pending_icon_16.clone();
                 let final_icon_key = icon_key.trim().to_string();
                 grp.items.push(ShortcutItem { column_added_at: crate::model::next_column_added_at(), use_default_color: ed_state.use_default_color,
                     id: updated_item_id.clone(),
@@ -811,9 +838,6 @@ pub unsafe fn commit_edit_shortcut_from_controls(
                 item.target_path = target_path;
                 item.icon_key = icon_key;
                 if let Some(ref ico) = ed_state.pending_icon_16 {
-                    let icon_dir = app.base_dir.join("user").join("icons");
-                    let _ = std::fs::create_dir_all(&icon_dir);
-                    let _ = ico.save_png(&icon_dir.join(format!("{}.png", item.id)));
                     item.custom_icon_16 = Some(ico.clone());
                 }
                 item.text_color = ed_state.text_color;

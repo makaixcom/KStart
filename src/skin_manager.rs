@@ -1,8 +1,8 @@
-//! 皮肤管理器的本地/网络页、等比预览和共用平面滚动条。
+//! 皮肤管理器的本地/网络页、等比预览和原生滚动条。
 use crate::{
     config::SkinEntry,
     native_dialogs::{self, create_ctrl},
-    skin_assets::{Canvas, RgbaSurface},
+    skin_assets::RgbaSurface,
     to_wide, AppState, APP_STATE,
 };
 use std::os::windows::fs::MetadataExt;
@@ -12,7 +12,7 @@ use windows_sys::Win32::{
     Graphics::Gdi::*,
     UI::{
         Controls::*,
-        Input::KeyboardAndMouse::{EnableWindow, GetCapture, ReleaseCapture, SetCapture},
+        Input::KeyboardAndMouse::EnableWindow,
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::*,
     },
@@ -57,7 +57,7 @@ pub unsafe fn populate(hwnd: HWND, font: HFONT, app: &AppState) {
         0,
         WS_BORDER
             | WS_TABSTOP
-            | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS) as u32,
+            | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS) as u32,
         12,
         38,
         152,
@@ -111,8 +111,8 @@ pub unsafe fn populate(hwnd: HWND, font: HFONT, app: &AppState) {
     );
     SetWindowSubclass(edit, Some(source_proc), SUBCLASS, DETAIL_SCROLL as usize);
     for id in [SCROLL, DETAIL_SCROLL] {
-        let bar = create_ctrl(hwnd, font, "STATIC", "", 0, 0x000D, 164, 38, 14, 588, id);
-        SetWindowSubclass(bar, Some(bar_proc), SUBCLASS, 0);
+        create_ctrl(hwnd, font, "SCROLLBAR", "", 0, WS_TABSTOP | SBS_VERT as u32, 164, 38, crate::dialog_scrollbars::WIDTH, 588, id);
+        sync_scrollbar(hwnd, id);
     }
     create_ctrl(
         hwnd,
@@ -253,22 +253,24 @@ pub unsafe fn arrange(hwnd: HWND, w: i32, h: i32, split: i32) {
         );
     };
     move_to(TAB, 12, 8, split - 24, 28);
-    move_to(native_dialogs::ID_SKIN_LIST, 12, 38, split - 40, h - 92);
-    move_to(SCROLL, split - 28, 38, 14, h - 92);
+    move_to(native_dialogs::ID_SKIN_LIST, 12, 38, split - 34, h - 92);
+    move_to(SCROLL, split - 22, 38, crate::dialog_scrollbars::WIDTH, h - 92);
     move_to(TITLE, split + 12, 10, w - split - 24, 22);
     move_to(PREVIEW, split + 12, 38, w - split - 24, (h - 224).max(40));
     move_to(
         native_dialogs::ID_SKIN_AUTHOR_EDIT,
         split + 12,
         h - 174,
-        w - split - 40,
+        w - split - 34,
         100,
     );
-    move_to(DETAIL_SCROLL, w - 28, h - 174, 14, 100);
+    move_to(DETAIL_SCROLL, w - 22, h - 174, crate::dialog_scrollbars::WIDTH, 100);
     move_to(NETWORK, split + 12, 62, w - split - 24, 48);
     move_to(native_dialogs::ID_SKIN_APPLY, w - 184, h - 74, 78, 26);
     move_to(DELETE, w - 96, h - 74, 78, 26);
     move_to(IDCANCEL, w - 96, h - 38, 78, 26);
+    sync_scrollbar(hwnd, SCROLL);
+    sync_scrollbar(hwnd, DETAIL_SCROLL);
 }
 
 pub unsafe fn paint_splitter(hwnd: HWND, dc: HDC) {
@@ -366,7 +368,7 @@ unsafe fn scroll_info(parent: HWND, bar: i32) -> (HWND, usize, usize, usize, i32
 
 pub unsafe fn draw(draw: &DRAWITEMSTRUCT, app: &AppState) -> bool {
     let id = draw.CtlID as i32;
-    if ![native_dialogs::ID_SKIN_LIST, PREVIEW, SCROLL, DETAIL_SCROLL].contains(&id) {
+    if ![native_dialogs::ID_SKIN_LIST, PREVIEW].contains(&id) {
         return false;
     }
     let background = crate::advanced_style::PAGE;
@@ -433,37 +435,6 @@ pub unsafe fn draw(draw: &DRAWITEMSTRUCT, app: &AppState) -> bool {
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
             );
         }
-    } else {
-        let (_, total, visible, top, _) = scroll_info(GetParent(draw.hwndItem), id);
-        if total > visible {
-            let (w, h) = (
-                draw.rcItem.right - draw.rcItem.left,
-                draw.rcItem.bottom - draw.rcItem.top,
-            );
-            let mut canvas = Canvas::new(w, h);
-            crate::renderer::draw_flat_scrollbar(&mut canvas, 0, 0, w, h, visible, total, top);
-            let surface = RgbaSurface::from_pixels(
-                w as u32,
-                h as u32,
-                canvas
-                    .buffer
-                    .iter()
-                    .map(|p| {
-                        let [b, g, r, _] = p.to_le_bytes();
-                        [r, g, b, 255]
-                    })
-                    .collect(),
-            );
-            native_dialogs::blit_surface_on_bg(
-                draw.hDC,
-                &surface,
-                0,
-                0,
-                w,
-                h,
-                [rgb[0], rgb[1], rgb[2]],
-            );
-        }
     }
     true
 }
@@ -476,7 +447,7 @@ unsafe fn scroll_to(parent: HWND, bar: i32, position: usize) {
     } else {
         SendMessageW(source, EM_LINESCROLL, 0, position as isize - old as isize);
     }
-    InvalidateRect(GetDlgItem(parent, bar), ptr::null(), 0);
+    sync_scrollbar(parent, bar);
 }
 
 unsafe extern "system" fn source_proc(
@@ -508,87 +479,56 @@ unsafe extern "system" fn source_proc(
         WM_SETTEXT,
         LB_SETTOPINDEX,
         EM_LINESCROLL,
+        LB_ADDSTRING,
+        LB_RESETCONTENT,
     ]
     .contains(&msg)
     {
-        InvalidateRect(GetDlgItem(GetParent(hwnd), bar as i32), ptr::null(), 0);
+        sync_scrollbar(GetParent(hwnd), bar as i32);
     }
     result
 }
 
-unsafe extern "system" fn bar_proc(
-    hwnd: HWND,
-    msg: u32,
-    wp: WPARAM,
-    lp: LPARAM,
-    id: usize,
-    _: usize,
-) -> LRESULT {
-    if msg == WM_NCDESTROY {
-        RemoveWindowSubclass(hwnd, Some(bar_proc), id);
-        RemovePropW(hwnd, to_wide("KStart.ScrollGrab").as_ptr());
-        return DefSubclassProc(hwnd, msg, wp, lp);
-    }
-    let parent = GetParent(hwnd);
-    let bar = GetDlgCtrlID(hwnd);
-    if [
-        WM_LBUTTONDOWN,
-        WM_MOUSEMOVE,
-        WM_LBUTTONUP,
-        WM_CAPTURECHANGED,
-    ]
-    .contains(&msg)
-    {
-        let (_, total, visible, top, _) = scroll_info(parent, bar);
-        let mut area: RECT = mem::zeroed();
-        GetClientRect(hwnd, &mut area);
-        let (y, _, travel) =
-            crate::renderer::flat_scrollbar_metrics(area.bottom, visible, total, top);
-        let (_, thumb, _) =
-            crate::renderer::flat_scrollbar_metrics(area.bottom, visible, total, top);
-        let pointer = ((lp >> 16) as i16) as i32;
-        if msg == WM_LBUTTONDOWN && total > visible {
-            if pointer < 14 {
-                scroll_to(parent, bar, top.saturating_sub(1));
-            } else if pointer >= area.bottom - 14 {
-                scroll_to(parent, bar, top + 1);
-            } else if pointer >= y && pointer < y + thumb {
-                SetPropW(
-                    hwnd,
-                    to_wide("KStart.ScrollGrab").as_ptr(),
-                    (pointer - y + 1) as isize,
-                );
-                SetCapture(hwnd);
-            } else {
-                scroll_to(
-                    parent,
-                    bar,
-                    if pointer < y {
-                        top.saturating_sub(visible)
-                    } else {
-                        top + visible
-                    },
-                );
-            }
-            return 0;
+/// 滚动范围、页大小和滑块位置交给系统 SCROLLBAR 绘制与跟踪。
+unsafe fn sync_scrollbar(parent: HWND, id: i32) {
+    let bar = GetDlgItem(parent, id);
+    if bar == 0 { return; }
+    let (_, total, visible, top, _) = scroll_info(parent, id);
+    let info = SCROLLINFO {
+        cbSize: mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL,
+        nMin: 0,
+        nMax: total.saturating_sub(1) as i32,
+        nPage: visible as u32,
+        nPos: top as i32,
+        nTrackPos: 0,
+    };
+    SetScrollInfo(bar, SB_CTL, &info, 1);
+}
+
+pub unsafe fn vscroll(parent: HWND, wp: WPARAM, lp: LPARAM) -> bool {
+    let bar = lp as HWND;
+    let id = GetDlgCtrlID(bar);
+    if bar == 0 || !matches!(id, SCROLL | DETAIL_SCROLL) { return false; }
+    let (_, total, visible, top, _) = scroll_info(parent, id);
+    let position = match (wp & 0xffff) as i32 {
+        SB_LINEUP => top.saturating_sub(1),
+        SB_LINEDOWN => top + 1,
+        SB_PAGEUP => top.saturating_sub(visible),
+        SB_PAGEDOWN => top + visible,
+        SB_TOP => 0,
+        SB_BOTTOM => total,
+        SB_THUMBPOSITION | SB_THUMBTRACK => {
+            let mut info: SCROLLINFO = mem::zeroed();
+            info.cbSize = mem::size_of::<SCROLLINFO>() as u32;
+            info.fMask = SIF_TRACKPOS;
+            GetScrollInfo(bar, SB_CTL, &mut info);
+            info.nTrackPos.max(0) as usize
         }
-        if msg == WM_MOUSEMOVE && GetCapture() == hwnd && travel > 0 {
-            let grab = GetPropW(hwnd, to_wide("KStart.ScrollGrab").as_ptr()) as i32 - 1;
-            let position = (pointer - 14 - grab).clamp(0, travel) as usize
-                * total.saturating_sub(visible)
-                / travel as usize;
-            scroll_to(parent, bar, position);
-            return 0;
-        }
-        if msg == WM_LBUTTONUP && GetCapture() == hwnd {
-            ReleaseCapture();
-            return 0;
-        }
-        if msg == WM_CAPTURECHANGED {
-            RemovePropW(hwnd, to_wide("KStart.ScrollGrab").as_ptr());
-        }
-    }
-    DefSubclassProc(hwnd, msg, wp, lp)
+        _ => return true,
+    };
+    scroll_to(parent, id, position);
+    true
 }
 
 pub unsafe fn delete(hwnd: HWND) {

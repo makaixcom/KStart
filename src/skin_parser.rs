@@ -117,7 +117,7 @@ pub enum ToolButtonKind {
     Mail,
     /// 类别管理按钮 (原 cmd3 / button3)
     Category,
-    /// 文件夹保护/群组按钮 (原 cmd4 / button4)
+    /// 新建栏目按钮 (原 cmd4 / button4，保留历史枚举名和配置键兼容皮肤)
     FolderLock,
     /// 排序/数据备份按钮 (原 cmd5 / button5)
     Backup,

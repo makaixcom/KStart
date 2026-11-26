@@ -1,25 +1,18 @@
-//! 高级设置的自绘面板、图标导航与按钮。
+//! 高级设置的背景与字体、间距示意图；交互控件由 Windows 绘制。
 
 use crate::{
     advanced::FontSetting, native_dialogs::blit_surface_on_bg, skin_assets::RgbaSurface, to_wide,
 };
-use std::{mem, ptr, sync::OnceLock};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use std::sync::OnceLock;
+use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GetStockObject, InvalidateRect, LineTo, MoveToEx, SelectObject, SetBkMode, SetBkColor,
+    CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW,
+    FillRect, GetStockObject, SelectObject, SetBkMode, SetBkColor,
     SetTextColor, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, PAINTSTRUCT, PS_SOLID,
+    DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT,
     TRANSPARENT,
 };
-use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, IsWindowEnabled};
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowTextLengthW, GetWindowTextW, SendMessageW, BM_GETCHECK, BM_GETSTATE,
-    BM_SETCHECK, BM_SETSTATE, BST_PUSHED, WM_ENABLE, WM_ERASEBKGND, WM_GETFONT, WM_KILLFOCUS,
-    WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT, WM_SETFOCUS, WM_SETTEXT,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     u32::from_le_bytes([r, g, b, 0])
@@ -31,7 +24,6 @@ const BORDER: u32 = rgb(201, 211, 220);
 const INK: u32 = rgb(36, 51, 62);
 const ACCENT: u32 = rgb(14, 113, 125);
 const LIGHT_ACCENT: u32 = rgb(223, 242, 242);
-const MUTED: u32 = rgb(121, 132, 141);
 
 const ICONS: [&[u8]; 7] = [
     include_bytes!("../assets/icons/menu_options.png"),
@@ -222,47 +214,6 @@ pub unsafe fn paint_spacing_preview(dc: HDC, pixels: u32, mode: usize) {
     }
 }
 
-pub unsafe fn draw_navigation(draw: &DRAWITEMSTRUCT, font: HFONT) {
-    let row = draw.rcItem;
-    let selected = draw.itemState & ODS_SELECTED != 0;
-    fill(draw.hDC, row, NAV);
-    let Some(label) = crate::advanced::PAGES.get(draw.itemID as usize) else {
-        return;
-    };
-    let (color, y) = (
-        if selected { LIGHT_ACCENT } else { NAV },
-        (row.top + row.bottom - 16) / 2,
-    );
-    if selected {
-        fill(
-            draw.hDC,
-            rect(row.left + 2, row.top + 2, row.right - 2, row.bottom - 2),
-            color,
-        );
-        fill(
-            draw.hDC,
-            rect(row.left + 2, row.top + 2, row.left + 5, row.bottom - 2),
-            ACCENT,
-        );
-    }
-    icon(draw.hDC, draw.itemID as usize + 1, row.left + 10, y, color);
-    text(
-        draw.hDC,
-        font,
-        rect(row.left + 34, row.top, row.right - 3, row.bottom),
-        &to_wide(label),
-        if selected { ACCENT } else { INK },
-        false,
-    );
-    if draw.itemState & ODS_FOCUS != 0 && !selected {
-        fill(
-            draw.hDC,
-            rect(row.left + 6, row.bottom - 2, row.right - 4, row.bottom - 1),
-            BORDER,
-        );
-    }
-}
-
 pub unsafe fn static_color(dc: HDC) -> HBRUSH {
     SetBkMode(dc, TRANSPARENT as i32);
     SetTextColor(dc, INK);
@@ -274,135 +225,4 @@ pub unsafe fn static_color(dc: HDC) -> HBRUSH {
 pub unsafe fn erase_background(hwnd: HWND, dc: HDC) {
     let mut bounds = rect(0, 0, 0, 0);
     if GetClientRect(hwnd, &mut bounds) != 0 { fill(dc, bounds, PAGE); }
-}
-
-pub unsafe fn button(hwnd: HWND, checkbox: bool, primary: bool) {
-    if hwnd != 0 {
-        SetWindowSubclass(
-            hwnd,
-            Some(button_proc),
-            1,
-            usize::from(checkbox) | (usize::from(primary) << 1),
-        );
-    }
-}
-
-unsafe fn paint_button(hwnd: HWND, dc: HDC, mode: usize) {
-    let mut bounds = rect(0, 0, 0, 0);
-    if GetClientRect(hwnd, &mut bounds) == 0 {
-        return;
-    }
-    let enabled = IsWindowEnabled(hwnd) != 0;
-    let focused = GetFocus() == hwnd;
-    let pressed = SendMessageW(hwnd, BM_GETSTATE, 0, 0) as u32 & BST_PUSHED != 0;
-    let font = SendMessageW(hwnd, WM_GETFONT, 0, 0) as HFONT;
-    let length = GetWindowTextLengthW(hwnd).max(0);
-    let mut title = vec![0; length as usize + 1];
-    GetWindowTextW(hwnd, title.as_mut_ptr(), length + 1);
-
-    if mode & 1 != 0 {
-        fill(dc, bounds, PAGE);
-        let top = (bounds.bottom - 13) / 2;
-        let checked = SendMessageW(hwnd, BM_GETCHECK, 0, 0) == 1;
-        let edge = if focused || checked { ACCENT } else { BORDER };
-        boxed(
-            dc,
-            rect(1, top, 14, top + 13),
-            edge,
-            if checked && enabled {
-                ACCENT
-            } else if pressed {
-                LIGHT_ACCENT
-            } else {
-                NAV
-            },
-        );
-        if checked && enabled {
-            let pen = CreatePen(PS_SOLID, 2, NAV);
-            if pen != 0 {
-                let old = SelectObject(dc, pen);
-                MoveToEx(dc, 4, top + 6, ptr::null_mut());
-                LineTo(dc, 7, top + 9);
-                LineTo(dc, 11, top + 4);
-                SelectObject(dc, old);
-                DeleteObject(pen);
-            }
-        }
-        bounds.left += 19;
-        text(
-            dc,
-            font,
-            bounds,
-            &title,
-            if enabled { INK } else { MUTED },
-            false,
-        );
-    } else {
-        let primary = mode & 2 != 0;
-        let background = if primary {
-            ACCENT
-        } else if pressed {
-            LIGHT_ACCENT
-        } else {
-            NAV
-        };
-        boxed(
-            dc,
-            bounds,
-            if primary || focused { ACCENT } else { BORDER },
-            background,
-        );
-        text(
-            dc,
-            font,
-            bounds,
-            &title,
-            if primary {
-                NAV
-            } else if enabled {
-                INK
-            } else {
-                MUTED
-            },
-            true,
-        );
-    }
-}
-
-unsafe extern "system" fn button_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    id: usize,
-    mode: usize,
-) -> LRESULT {
-    match msg {
-        WM_ERASEBKGND => 1,
-        WM_PAINT => {
-            let mut ps: PAINTSTRUCT = mem::zeroed();
-            let dc = BeginPaint(hwnd, &mut ps);
-            paint_button(hwnd, dc, mode);
-            EndPaint(hwnd, &ps);
-            0
-        }
-        WM_PRINTCLIENT => {
-            paint_button(hwnd, wparam as HDC, mode);
-            0
-        }
-        WM_NCDESTROY => {
-            RemoveWindowSubclass(hwnd, Some(button_proc), id);
-            DefSubclassProc(hwnd, msg, wparam, lparam)
-        }
-        _ => {
-            let result = DefSubclassProc(hwnd, msg, wparam, lparam);
-            if matches!(
-                msg,
-                BM_SETCHECK | BM_SETSTATE | WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE | WM_SETTEXT
-            ) {
-                InvalidateRect(hwnd, ptr::null(), 0);
-            }
-            result
-        }
-    }
 }

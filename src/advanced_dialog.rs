@@ -8,7 +8,7 @@ use windows_sys::Win32::Graphics::Gdi::{HDC, HFONT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetDlgItem, SendMessageW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
     BS_DEFPUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, ES_AUTOHSCROLL,
-    IDCANCEL, IDOK, LBN_SELCHANGE, LBS_HASSTRINGS, LBS_NOTIFY, LBS_OWNERDRAWFIXED, LB_ADDSTRING,
+    IDCANCEL, IDOK, LBN_SELCHANGE, LBS_HASSTRINGS, LBS_NOTIFY, LB_ADDSTRING,
     LB_GETCURSEL, LB_SETCURSEL, LB_SETITEMHEIGHT, SW_HIDE, SW_SHOW, WS_EX_CLIENTEDGE, WS_TABSTOP,
     WS_VSCROLL, SBM_GETPOS, SBM_SETPOS, SBM_SETRANGE, SB_LINELEFT, SB_LINERIGHT,
     SB_PAGELEFT, SB_PAGERIGHT, SB_THUMBTRACK, SB_THUMBPOSITION, SB_LEFT, SB_RIGHT,
@@ -18,7 +18,6 @@ pub const WIDTH: i32 = 504;
 pub const HEIGHT: i32 = 448;
 pub const ID_PAGE: i32 = 2000;
 pub const ID_RESET: i32 = 2001;
-pub const ID_CLEAR_CACHE: i32 = 2002;
 pub const ID_BACKUP: i32 = 2003;
 pub const ID_RESTORE: i32 = 2004;
 pub const ID_DESKTOP: i32 = 2005;
@@ -118,9 +117,7 @@ const POSITIONS: [&[(i32, i32, i32, i32)]; 6] = [
         (326, 60, 166, 0),
         (153, 81, 337, 0),
         (153, 124, 164, 0),
-        (319, 124, 173, 0),
         (153, 146, 164, 0),
-        (319, 146, 173, 0),
         (153, 205, 195, 0),
         (346, 205, 146, 0),
         (153, 227, 338, 0),
@@ -179,7 +176,6 @@ const SECTIONS: &[(usize, &str, i32)] = &[
 ];
 
 const ACTIONS: &[(i32, usize, &str, i32, i32, i32)] = &[
-    (ID_CLEAR_CACHE, 2, "清空缓存", 410, 166, 78),
     (ID_FONT, 3, "设置字体", 398, 182, 91),
     (ID_SPACING, 3, "间距调整", 398, 156, 91),
     (ID_BACKUP, 5, "数据备份", 153, 210, 95),
@@ -223,7 +219,7 @@ pub unsafe fn populate(
         "LISTBOX",
         "",
         0,
-        WS_TABSTOP | (LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS) as u32,
+        WS_TABSTOP | (LBS_NOTIFY | LBS_HASSTRINGS) as u32,
         15,
         38,
         117,
@@ -279,7 +275,7 @@ pub unsafe fn populate(
                     .unwrap_or(0);
                 SendMessageW(items, LB_SETCURSEL, selection, 0);
             } else if matches!(field.kind, FieldKind::Check(_)) {
-                let control = create_ctrl(
+                create_ctrl(
                     hwnd,
                     font,
                     "BUTTON",
@@ -292,7 +288,6 @@ pub unsafe fn populate(
                     21,
                     id,
                 );
-                super::advanced_style::button(control, true, false);
             } else {
                 create_ctrl(
                     hwnd,
@@ -336,7 +331,7 @@ pub unsafe fn populate(
                         field_x,y,field_width,22,id);
                 } else if field.key == Key::ListOpacity {
                     let slider = create_ctrl(hwnd, font, "SCROLLBAR", "", 0,
-                        WS_TABSTOP, field_x, y + 3, field_width - 64, 18, id);
+                        WS_TABSTOP, field_x, y + 8, field_width - 64, crate::dialog_scrollbars::WIDTH, id);
                     SendMessageW(slider, SBM_SETRANGE, 10, 100);
                     create_ctrl(hwnd, font, "STATIC", "", 0, 0,
                         field_x + field_width - 60, y + 4, 60, 17, ID_OPACITY_VALUE);
@@ -371,7 +366,6 @@ pub unsafe fn populate(
                             id + PICK_OFFSET,
                         );
                         if icon { install_icon_tip(hwnd,control,field.key); }
-                        else {super::advanced_style::button(control, false, false);}
                     }
                 }
             }
@@ -379,7 +373,7 @@ pub unsafe fn populate(
     }
     for &(id, page, label, x, y, width) in ACTIONS {
         let y=if page==5{y-74}else{y};
-        let control = create_ctrl(
+        create_ctrl(
             hwnd,
             font,
             "BUTTON",
@@ -392,14 +386,13 @@ pub unsafe fn populate(
             23,
             id,
         );
-        super::advanced_style::button(control, false, false);
     }
     for (id, label, x) in [
         (IDOK, "确定", 258),
         (IDCANCEL, "取消", 336),
         (ID_RESET, "重置", 414),
     ] {
-        let control = create_ctrl(
+        create_ctrl(
             hwnd,
             font,
             "BUTTON",
@@ -417,7 +410,6 @@ pub unsafe fn populate(
             23,
             id,
         );
-        super::advanced_style::button(control, false, id == IDOK);
     }
     for page in 0..advanced::PAGES.len() {
         load_page(hwnd, page, settings);
@@ -662,4 +654,14 @@ pub unsafe fn draw_picker_icon(draw:&windows_sys::Win32::UI::Controls::DRAWITEMS
     }
     if draw.itemState&ODS_FOCUS!=0{DrawFocusRect(draw.hDC,&draw.rcItem);}
     true
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_setting_has_a_control_position() {
+        for (fields, positions) in super::advanced::FIELDS.iter().zip(super::POSITIONS) {
+            assert_eq!(fields.len(), positions.len());
+        }
+    }
 }

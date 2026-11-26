@@ -23,8 +23,10 @@ KStart 是基于 Rust、Win32 和 GDI 的 Windows 桌面启动器。项目包含
 | [`src/main.rs`](src/main.rs) | 应用入口、窗口消息分发和运行状态 |
 | [`src/popup.rs`](src/popup.rs)、[`src/native_dialogs.rs`](src/native_dialogs.rs) | 弹出菜单窗口和管理对话框控件 |
 | [`src/renderer.rs`](src/renderer.rs) | 画布绘制、文字指令与命中测试 |
-| [`src/search.rs`](src/search.rs)、[`src/search_dialog.rs`](src/search_dialog.rs) | 搜索模式与匹配、结果窗口 |
+| [`src/search.rs`](src/search.rs)、[`src/search_dialog.rs`](src/search_dialog.rs)、[`src/main_search.rs`](src/main_search.rs) | 搜索模式与匹配、结果窗口、主界面原生搜索输入框 |
+| [`src/schedule_reminder.rs`](src/schedule_reminder.rs) | 计划提醒窗口、60 秒自动关闭与声音播放 |
 | [`src/config.rs`](src/config.rs)、[`src/model.rs`](src/model.rs) | 配置与热键、分类和快捷方式数据 |
+| [`src/schedule.rs`](src/schedule.rs)、[`src/schedule_runtime.rs`](src/schedule_runtime.rs)、[`src/schedule_dialog.rs`](src/schedule_dialog.rs) | `user/plan.json`、计划触发与批处理执行、计划任务管理窗口 |
 | [`src/skin_parser.rs`](src/skin_parser.rs)、[`src/skin_assets.rs`](src/skin_assets.rs) | 皮肤字段与锚点、位图与图标加载 |
 | [`skin/`](skin/)、[`assets/`](assets/) | 皮肤包及内置公共资源 |
-| [`user/`](user/) | 用户运行期配置、数据和图标缓存 |
+| [`user/`](user/) | 用户运行期配置和数据 |

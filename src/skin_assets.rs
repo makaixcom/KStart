@@ -242,7 +242,18 @@ impl BuiltinIcons {
         };
         self.app_icons.get(key).unwrap_or_else(|| if name.contains("cube") { &self.cat_cube } else { &self.cat_laptop })
     }
-    /// 加载 `assets/icons/` 与 `user/icons/` 下的所有像素图标
+    /// 类别自选图标直接读取原文件，仅用于内存显示。
+    pub fn load_category_source(&mut self, base_dir: &Path, name: &str) {
+        if self.app_icons.contains_key(name) { return; }
+        let path = crate::targets::resolve_path(base_dir, name);
+        if path.is_file() {
+            if let Some(icon) = load_custom_icon_16(&path) {
+                self.app_icons.insert(name.to_string(), icon.resize_to(16, 16));
+            }
+        }
+    }
+
+    /// 加载内置像素图标
     pub fn load(base_dir: &Path) -> Self {
         let icon_dir = base_dir.join("assets").join("icons");
         let load_or_empty = |name: &str, w: u32, h: u32| -> RgbaSurface {
@@ -250,6 +261,7 @@ impl BuiltinIcons {
                 .unwrap_or_else(|| RgbaSurface::new_empty(w, h))
         };
         let about_banner = RgbaSurface::load_file(&base_dir.join("assets").join("about_banner.png"))
+            .map(|image| image.resize_to(137, 360))
             .unwrap_or_else(|| RgbaSurface::new_empty(137, 360));
 
         let mut app_icons = HashMap::new();
@@ -277,21 +289,6 @@ impl BuiltinIcons {
             "app_proxylane64",
         ] {
             app_icons.insert(key.to_string(), load_or_empty(key, 16, 16));
-        }
-
-        // 加载用户拖入文件生成的自定义图标 (`user/icons/*.png`)
-        let user_icon_dir = base_dir.join("user").join("icons");
-        if let Ok(entries) = fs::read_dir(&user_icon_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().map(|e| e == "png").unwrap_or(false) {
-                    if let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) {
-                        if let Some(surf) = RgbaSurface::load_file(&p) {
-                            app_icons.insert(stem, surf);
-                        }
-                    }
-                }
-            }
         }
 
         if let Ok(entries) = fs::read_dir(base_dir.join("icons/small")) {

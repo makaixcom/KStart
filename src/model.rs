@@ -123,7 +123,7 @@ pub struct AppDataStore {
 }
 
 #[cfg(test)]
-mod icon_cache_tests {
+mod runtime_tree_tests {
     use super::*;
     #[test]
     fn legacy_membership_order_survives_sort_save_and_reload() {
@@ -181,22 +181,6 @@ mod icon_cache_tests {
         fs::remove_dir_all(base).unwrap();
     }
 
-    #[test]
-    fn source_path_and_internal_icon_cache_remain_independent() {
-        let mut store = AppDataStore::default_store();
-        let item = &mut store.shortcuts[0];
-        let id = item.id.clone();
-        item.icon_key = r"Z:\missing-source\application.exe".into();
-        let mut icons = HashMap::new();
-        let mut icon = RgbaSurface::new_empty(32, 32);
-        icon.pixels_mut()[0] = [10, 20, 30, 255];
-        icons.insert(id.clone(), icon);
-        let tree = store.build_runtime_tree(Path::new("."), &icons, &HashMap::new());
-        let loaded = tree.iter().flat_map(|cat| &cat.groups).flat_map(|group| &group.items)
-            .find(|item| item.id == id).unwrap();
-        assert_eq!(loaded.icon_key, r"Z:\missing-source\application.exe");
-        assert_eq!(loaded.custom_icon_16.as_ref().unwrap().pixels()[0], [10, 20, 30, 255]);
-    }
 
 }
 
@@ -268,12 +252,19 @@ impl AppDataStore {
                 let items = sc_list
                     .into_iter()
                     .enumerate()
-                    .map(|(index, sc)| {
+                    .map(|(index, mut sc)| {
+                        let source = crate::targets::resolve_path(base_dir, &sc.icon_key);
+                        if source.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("lnk")) {
+                            let link = crate::advanced_shell::file_link(&source);
+                            sc.icon_key = crate::advanced_runtime::default_drop_icon_source(
+                                &source, link.as_ref().map(|link| link.0.as_str())
+                            ).to_string_lossy().into_owned();
+                        }
                         let custom_icon_16 = custom_icons.get(&sc.icon_key)
-                            .or_else(|| custom_icons.get(&sc.id)).cloned().or_else(|| {
-                            // 兼容旧版把图标来源路径写入 icon_key 的记录。
+                            .cloned().or_else(|| {
+                            // 每次加载直接从来源读取图标，目录也通过 Shell 获取。
                             let path = crate::targets::resolve_path(base_dir, &sc.icon_key);
-                            path.is_file().then(|| crate::skin_assets::load_custom_icon_16(&path)).flatten()
+                            path.exists().then(|| crate::skin_assets::load_custom_icon_16(&path)).flatten()
                         });
                         let column_added_at = if sc.column_added_at == 0 { index as u64 + 1 } else { sc.column_added_at };
                         LAST_COLUMN_ADDED_AT.fetch_max(column_added_at, Ordering::Relaxed);

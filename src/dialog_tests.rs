@@ -14,11 +14,134 @@ const TIMER: usize = 0x4b5354;
 extern "system" {
     fn PrintWindow(hwnd: HWND, dc: HDC, flags: u32) -> i32;
 }
+/// 系统菜单由当前 UI 线程创建，按系统窗口类查找，避免依赖鼠标捕获实现。
+pub(crate) unsafe fn menu_window() -> HWND {
+    unsafe extern "system" fn find(hwnd: HWND, lp: LPARAM) -> i32 {
+        let mut name = [0u16; 32];
+        let len = GetClassNameW(hwnd, name.as_mut_ptr(), 32);
+        if String::from_utf16_lossy(&name[..len.max(0) as usize]) == "#32768" {
+            *(lp as *mut HWND) = hwnd;
+            return 0;
+        }
+        1
+    }
+    let mut result = 0;
+    EnumThreadWindows(windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+        Some(find), &mut result as *mut _ as LPARAM);
+    result
+}
+
 type Step = Box<dyn FnOnce(HWND)>;
+
+#[test]
+fn native_controls_and_editing_when_requested() {
+    let Some(base) = std::env::var_os("KSTART_NATIVE_UI_BASE") else { return; };
+    let base = PathBuf::from(base);
+    let shots = base.join("native-shots");
+    fs::create_dir_all(&shots).unwrap();
+    let app = AppState::new(base, ActivePopupMenu::None).unwrap();
+    let edit = app.make_edit_shortcut_modal(0, 0, 0).unwrap();
+    let settings = app.user_cfg.advanced.clone();
+    APP_STATE.with(|cell| *cell.try_borrow_mut().unwrap() = Some(app));
+    unsafe {
+        InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_LINK_CLASS,
+        });
+        let class = to_wide(NATIVE_MODAL_CLASS_NAME);
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(native_modal_wnd_proc),
+            hInstance: GetModuleHandleW(ptr::null()),
+            hCursor: LoadCursorW(0, IDC_ARROW),
+            lpszClassName: class.as_ptr(),
+            ..std::mem::zeroed()
+        });
+        for (name, modal, input) in [
+            ("about", ActiveModal::About, 1703),
+            ("shortcut", edit, native_dialogs::ID_EDIT_TITLE),
+            ("settings", ActiveModal::Advanced(settings), 0),
+            ("categories", ActiveModal::CategoryManager {
+                selected_idx: 0, renaming: false, rename_buf: String::new(),
+            }, native_dialogs::ID_CAT_RENAME_EDIT),
+        ] {
+            show_centered_modal(modal);
+            let hwnd = APP_STATE.with(|cell| cell.try_borrow().unwrap().as_ref().unwrap().modal_hwnd);
+            assert_ne!(hwnd, 0);
+            assert_ne!(GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_CAPTION, 0);
+            if input != 0 {
+                let edit = GetDlgItem(hwnd, input);
+                let mut class = [0u16; 32];
+                let length = GetClassNameW(edit, class.as_mut_ptr(), class.len() as i32);
+                assert_eq!(String::from_utf16_lossy(&class[..length as usize]), "Edit");
+                if name == "about" {
+                    assert_ne!(GetWindowLongW(edit, GWL_STYLE) as u32 & ES_READONLY as u32, 0);
+                    assert_ne!(GetDlgItem(hwnd, 1701), 0, "应创建原生 SysLink");
+                    let mut client: RECT = std::mem::zeroed();
+                    let mut bounds: RECT = std::mem::zeroed();
+                    GetClientRect(edit, &mut client);
+                    GetWindowRect(edit, &mut bounds);
+                    MapWindowPoints(edit, 0, &mut client as *mut RECT as *mut POINT, 2);
+                    assert_eq!(bounds.right - client.right - (client.left - bounds.left),
+                        dialog_scrollbars::WIDTH, "文本框应只为窄滚动条预留空间");
+                    let original = native_dialogs::get_ctrl_text(hwnd, input);
+                    native_dialogs::set_ctrl_text(hwnd, input, &format!("{original}{}", "\r\n滚动验证".repeat(30)));
+                    unsafe extern "system" fn find_bar(bar: HWND, lp: LPARAM) -> i32 {
+                        let (source, result) = &mut *(lp as *mut (HWND, HWND));
+                        if GetPropW(bar, to_wide(dialog_scrollbars::SOURCE).as_ptr()) == *source
+                            && GetWindowLongW(bar, GWL_STYLE) as u32 & SBS_VERT as u32 != 0 {
+                            *result = bar;
+                        }
+                        1
+                    }
+                    let mut pair = (edit, 0 as HWND);
+                    EnumChildWindows(hwnd, Some(find_bar), &mut pair as *mut _ as LPARAM);
+                    assert_ne!(pair.1, 0, "文本框应有独立的窄原生滚动条");
+                    let mut bar_bounds: RECT = std::mem::zeroed();
+                    GetWindowRect(pair.1, &mut bar_bounds);
+                    assert_eq!(bar_bounds.right - bar_bounds.left, dialog_scrollbars::WIDTH);
+                    let top = SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+                    SendMessageW(hwnd, WM_VSCROLL, SB_LINEDOWN as usize, pair.1);
+                    assert!(SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0) > top);
+                    native_dialogs::set_ctrl_text(hwnd, input, &original);
+                    let text = native_dialogs::get_ctrl_text(hwnd, input);
+                    SendMessageW(edit, WM_CHAR, b'X' as usize, 0);
+                    assert_eq!(native_dialogs::get_ctrl_text(hwnd, input), text);
+                } else {
+                    native_dialogs::set_ctrl_text(hwnd, input, "中文😀输入");
+                    SendMessageW(edit, EM_SETSEL, 2, 4);
+                    SendMessageW(edit, EM_REPLACESEL, 1, to_wide("替换").as_ptr() as isize);
+                    assert_eq!(native_dialogs::get_ctrl_text(hwnd, input), "中文替换输入");
+                    assert_ne!(SendMessageW(edit, WM_UNDO, 0, 0), 0);
+                    assert_eq!(native_dialogs::get_ctrl_text(hwnd, input), "中文😀输入");
+                    SendMessageW(edit, WM_CHAR, 1, 0);
+                    let (mut start, mut end) = (0u32, 0u32);
+                    SendMessageW(edit, EM_GETSEL, &mut start as *mut _ as usize, &mut end as *mut _ as isize);
+                    assert_eq!((start, end), (0, 6), "{name}: Ctrl+A 应全选");
+                }
+            }
+            if name == "settings" {
+                for page in 0..advanced::PAGES.len() {
+                    advanced_dialog::select_page(hwnd, page);
+                    RedrawWindow(hwnd, ptr::null(), 0, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_ERASE);
+                    capture(hwnd, &shots.join(format!("settings-{page}.png")));
+                }
+            }
+            let button = GetDlgItem(hwnd, IDCANCEL);
+            assert_ne!(button, 0);
+            assert_ne!(GetWindowLongW(button, GWL_STYLE) as u32 & 0xf, BS_OWNERDRAW as u32);
+            RedrawWindow(hwnd, ptr::null(), 0, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_ERASE);
+            capture(hwnd, &shots.join(format!("{name}.png")));
+            SendMessageW(button, BM_CLICK, 0, 0);
+            assert_eq!(IsWindow(hwnd), 0, "取消按钮应关闭窗口");
+        }
+    }
+    APP_STATE.with(|cell| *cell.try_borrow_mut().unwrap() = None);
+}
 thread_local! {
     static ACTIVE:Cell<bool>=const{Cell::new(false)};
     static STEPS:RefCell<VecDeque<Step>>=RefCell::new(VecDeque::new());
 }
+pub(crate) fn enable(value: bool) { ACTIVE.with(|active| active.set(value)); }
 pub fn active() -> bool {
     ACTIVE.with(Cell::get)
 }
@@ -40,11 +163,11 @@ pub unsafe fn step(hwnd: HWND, id: usize) -> bool {
     }
     true
 }
-fn queue(step: impl FnOnce(HWND) + 'static) {
+pub(crate) fn queue(step: impl FnOnce(HWND) + 'static) {
     STEPS.with(|steps| steps.try_borrow_mut().unwrap().push_back(Box::new(step)));
 }
 
-unsafe fn capture(hwnd: HWND, path: &Path) {
+pub(crate) unsafe fn capture(hwnd: HWND, path: &Path) {
     let mut rect: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut rect);
     let (w, h) = (rect.right, rect.bottom);
@@ -272,6 +395,10 @@ fn native_column_and_skin_workflows_when_requested() {
         );
         capture(skin, &shots.join("skin-local-native.png"));
         let list = GetDlgItem(skin, native_dialogs::ID_SKIN_LIST);
+        // 构造足够多的列表行，使滚动验收不依赖安装的皮肤数量。
+        for index in 0..60 {
+            SendMessageW(list, LB_ADDSTRING, 0, to_wide(&format!("滚动验证皮肤 {index}")).as_ptr() as isize);
+        }
         let top = SendMessageW(list, LB_GETTOPINDEX, 0, 0);
         SendMessageW(list, WM_MOUSEWHEEL, ((-120i16) as u16 as usize) << 16, 0);
         assert!(
@@ -279,15 +406,14 @@ fn native_column_and_skin_workflows_when_requested() {
             "皮肤列表应支持滚轮滚动"
         );
         let bar = GetDlgItem(skin, skin_manager::SCROLL);
-        let mut bar_rect: RECT = std::mem::zeroed();
-        GetClientRect(bar, &mut bar_rect);
+        let mut bar_class = [0u16; 32];
+        let len = GetClassNameW(bar, bar_class.as_mut_ptr(), 32);
+        assert_eq!(String::from_utf16_lossy(&bar_class[..len as usize]), "ScrollBar");
+        let mut bar_bounds: RECT = std::mem::zeroed();
+        GetWindowRect(bar, &mut bar_bounds);
+        assert_eq!(bar_bounds.right - bar_bounds.left, dialog_scrollbars::WIDTH);
         let top = SendMessageW(list, LB_GETTOPINDEX, 0, 0);
-        SendMessageW(
-            bar,
-            WM_LBUTTONDOWN,
-            1,
-            7 | ((bar_rect.bottom - 5) << 16) as isize,
-        );
+        SendMessageW(skin, WM_VSCROLL, SB_LINEDOWN as usize, bar);
         assert!(
             SendMessageW(list, LB_GETTOPINDEX, 0, 0) > top,
             "共用滚动条下箭头应滚动列表"
@@ -319,4 +445,50 @@ fn native_column_and_skin_workflows_when_requested() {
     }
     ACTIVE.with(|value| value.set(false));
     APP_STATE.with(|cell| cell.try_borrow_mut().unwrap().take());
+}
+
+#[test]
+fn deleting_last_column_confirms_and_keeps_original_files_when_requested() {
+    let Some(base)=std::env::var_os("KSTART_COLUMN_DELETE_UI_BASE")else{return;};
+    let base=PathBuf::from(base);let shots=base.join("shots");fs::create_dir_all(&shots).unwrap();
+    let original=base.join("original-file.txt");fs::write(&original,"保留原文件").unwrap();
+    let mut app=AppState::new(base.clone(),ActivePopupMenu::None).unwrap();
+    app.categories[0].groups.truncate(1);app.categories[0].active_group_index=0;
+    let mut item=app.categories[0].groups[0].items[0].clone();item.id="sc_delete_column_test".into();item.target_path=original.to_string_lossy().into_owned();item.icon_key=item.target_path.clone();item.custom_icon_16=None;
+    app.categories[0].groups[0].items=vec![item];app.selected_shortcuts.insert(0);app.persist_data();
+    let category_id=app.categories[0].id.clone();let other_count=app.categories[1].groups.len();
+    let data_before=fs::read(base.join("user/data.json")).unwrap();
+    let index=build_context_menu_items().iter().position(|item|matches!(item.action,ContextMenuAction::DeleteColumn)).unwrap();
+    let (_,request)=handle_context_menu_action(&mut app,index);assert!(matches!(request,DeferredDialogRequest::DeleteColumn(0,0)));assert_eq!(app.categories[0].groups.len(),1);
+    APP_STATE.with(|cell|*cell.try_borrow_mut().unwrap()=Some(app));enable(true);
+    unsafe{
+        let controls=INITCOMMONCONTROLSEX{dwSize:std::mem::size_of::<INITCOMMONCONTROLSEX>()as u32,dwICC:ICC_LISTVIEW_CLASSES};InitCommonControlsEx(&controls);
+        let data_path=base.join("user/data.json");
+        queue(move|hwnd|{arm(hwnd);confirm_delete_column(hwnd,0,0);assert_eq!(fs::read(&data_path).unwrap(),data_before);APP_STATE.with(|cell|assert_eq!(cell.try_borrow().unwrap().as_ref().unwrap().categories[0].groups.len(),1));arm(hwnd);});
+        let shot=shots.join("column-delete-confirm.png");queue(move|hwnd|{
+            let confirm=GetLastActivePopup(hwnd);assert_ne!(confirm,hwnd);assert_ne!(IsWindowVisible(confirm),0);
+            let mut child=FindWindowExW(confirm,0,to_wide("Static").as_ptr(),ptr::null());let mut found=false;
+            while child!=0 {let mut text=[0u16;512];let length=GetWindowTextW(child,text.as_mut_ptr(),text.len()as i32);let text=String::from_utf16_lossy(&text[..length.max(0)as usize]);if text.contains("确定删除栏目")&&text.contains("原文件不受影响"){found=true;}child=FindWindowExW(confirm,child,to_wide("Static").as_ptr(),ptr::null());}
+            assert!(found,"确认框应说明删除对象及保留原文件");
+            RedrawWindow(confirm,ptr::null(),0,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ALLCHILDREN);capture(confirm,&shot);SendMessageW(confirm,WM_COMMAND,IDNO as usize,0);
+        });
+        queue(|hwnd|{arm(hwnd);confirm_delete_column(hwnd,0,0);APP_STATE.with(|cell|{let guard=cell.try_borrow().unwrap();let app=guard.as_ref().unwrap();assert!(app.categories[0].groups.is_empty());assert!(app.selected_shortcuts.is_empty());assert_eq!(app.categories[0].active_group_index,0);assert!(renderer::shortcut_grid(&app.skin_cfg,app.user_cfg.window_width,app.user_cfg.window_height,&app.categories[0],&app.user_cfg.advanced).is_none());});arm(hwnd);});
+        queue(|hwnd|{let confirm=GetLastActivePopup(hwnd);assert_ne!(confirm,hwnd);SendMessageW(confirm,WM_COMMAND,IDYES as usize,0);});
+        queue(|hwnd|{SendMessageW(hwnd,WM_COMMAND,IDCANCEL as usize,0);});
+        column_dialog::open(0,0,0,column_dialog::Action::Rename);
+    }
+    enable(false);
+    assert!(original.is_file());
+    let saved=AppDataStore::load(&base);assert!(!saved.columns.iter().any(|column|column.category_id==category_id));assert!(!saved.shortcuts.iter().any(|item|item.category_id==category_id));
+    let tree=saved.build_runtime_tree(&base,&Default::default(),&Default::default());assert!(tree[0].groups.is_empty());assert_eq!(tree[1].groups.len(),other_count);
+    APP_STATE.with(|cell|{
+        let mut guard=cell.try_borrow_mut().unwrap();let app=guard.as_mut().unwrap();
+        let _draft=app.make_new_shortcut_modal(0,0,"取消的新建".into(),String::new(),String::new(),None,"");assert!(app.categories[0].groups.is_empty());
+        app.add_dropped_files(vec![advanced_runtime::DroppedFile{name:"原文件".into(),target:original.to_string_lossy().into_owned(),args:String::new(),work_dir:String::new(),icon:None,icon_source:original.to_string_lossy().into_owned()}]);
+        assert_eq!(app.categories[0].groups.len(),1);assert_eq!(app.categories[0].groups[0].items.len(),1);
+        let ids=app.categories.iter().flat_map(|cat|&cat.groups).map(|column|&column.id).collect::<HashSet<_>>();assert_eq!(ids.len(),app.categories.iter().map(|cat|cat.groups.len()).sum::<usize>());
+    });
+    assert_eq!(AppDataStore::load(&base).shortcuts.iter().filter(|item|item.category_id==category_id).count(),1);
+    assert!(!base.join("user/icons").exists());assert!(!base.join("user/icon-cache").exists());
+    APP_STATE.with(|cell|{cell.try_borrow_mut().unwrap().take();});
 }

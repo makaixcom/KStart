@@ -65,6 +65,30 @@ impl Canvas {
         self.draw_vline(x + w - 1, y, y + h - 1, color);
     }
 
+    /// 绘制透明底的 1 像素虚线框，超出画布的部分直接裁剪。
+    pub fn stroke_dashed_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: RgbColor) {
+        if w <= 0 || h <= 0 { return; }
+        let pixel = color.to_bgra_u32();
+        for px in x.max(0)..(x + w).min(self.width) {
+            if (px - x) % 4 < 2 {
+                for py in [y, y + h - 1] {
+                    if (0..self.height).contains(&py) {
+                        self.buffer[(py * self.width + px) as usize] = pixel;
+                    }
+                }
+            }
+        }
+        for py in y.max(0)..(y + h).min(self.height) {
+            if (py - y) % 4 < 2 {
+                for px in [x, x + w - 1] {
+                    if (0..self.width).contains(&px) {
+                        self.buffer[(py * self.width + px) as usize] = pixel;
+                    }
+                }
+            }
+        }
+    }
+
     /// 绘制 3D 凸起或凹陷经典边框（用于类别管理、栏目排序、热键管理、修改快捷方式等经典对话框按钮与输入框）
     pub fn stroke_3d_rect(
         &mut self,

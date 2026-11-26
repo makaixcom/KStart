@@ -42,12 +42,13 @@
 | --- | --- |
 | `user/config.ini` | 统一保存主窗口、高级设置、字体、间距、使用计数、热键和口令验证值。依次使用 `[Config]`、`[Advanced]`、`[Fonts]`、`[Spacing]`、`[Usage]`、`[Hotkeys]`、`[Verification]`。`[Hotkeys]` 以组合键为键，每条记录保存启用状态、备注和结构化目标。目标可以引用快捷方式 ID、保存独立快捷方式目标，或保存当前 Windows 用户加密的输出文本。兼容旧版 ID 和 `/AH/`、`/Search/` 等单值。 |
 | `user/data.json` | UTF-8 JSON。顶层包含 `categories`、`columns`、`shortcuts`。栏目以 `category_id` 关联类别，快捷方式以 `category_id` 和 `column_id` 关联类别和栏目。目标类型 `target_kind` 为 `file`、`folder`、`system`、`web` 或 `launcher`。文件和目录按 `path_mode` 区分相对和绝对路径，起始目录使用 `work_dir_mode`。相对路径以 KStart 数据根目录为基准。 |
-| `user/icons/` | 外部拖入的文件、文件夹及 `.lnk` 默认提取原生 16×16 图标并缓存为 `<id>.png`。编辑已有快捷方式时，由用户通过图标按钮发起替换。 |
+| `user/plan.json` | 独立保存计划任务、执行类型、日期时间、启用状态、提醒、批处理步骤与触发记录。不得写入 `data.json`；支持备份和恢复。任务执行不得在 `APP_STATE` 借用中打开窗口或调用启动操作，批处理延时不得阻塞消息循环。 |
+| 图标来源 | 拖入文件、文件夹时直接读取对象的 Shell 图标；`.lnk` 读取目标程序的图标。`icon_key` 保存图标来源路径。手动选择图标也只引用来源文件，不复制图标。 |
 
 高级设置按页编辑草稿，确定后应用，取消丢弃表单更改。重置只恢复当前页。备份、恢复、创建系统快捷方式和修改口令由各自的按钮单独发起。
 
 - 每个配置项均有默认值。配置文件缺失时，在内存中使用默认值，保存时一次写入完整配置。对应节缺失时，可读取旧版 `advanced-settings.json`、`hotkey.ini` 和 `*.credential`，后续保存统一写入 `config.ini`。
-- `user/icon-cache/` 存放可重建的派生图标。清空缓存不删除 `user/icons/` 中已选用的图标。
+- 不创建 `user/icons/` 或 `user/icon-cache/`，不将文件或网页图标缓存到磁盘；图标像素仅用于内存中的界面显示。
 - `[Verification]` 只存储加盐后的口令验证值。常规数据备份省略验证值，恢复备份时保留当前验证值。
 
 写入数据应复用既有模型及持久化路径，保持旧数据的读取兼容性。验证中涉及设置、缩放落盘或数据修改时，应使用隔离的用户目录。验证步骤见[构建与验证手册](../skills/kstart-build-and-verify/SKILL.md)。

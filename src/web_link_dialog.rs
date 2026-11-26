@@ -26,7 +26,7 @@ pub struct Draft {
     pub url: String,
     pub name: String,
     pub icon: Option<RgbaSurface>,
-    pub custom_icon: bool,
+    pub icon_source: String,
 }
 struct State {
     result: Option<Draft>,
@@ -34,6 +34,7 @@ struct State {
     fallback: Option<RgbaSurface>,
     name_manual: bool,
     icon_manual: bool,
+    icon_source: String,
     generation: u64,
     pending: bool,
     sender: mpsc::Sender<(u64, String)>,
@@ -61,6 +62,7 @@ pub unsafe fn show(owner: HWND, base: PathBuf) -> Option<Draft> {
         fallback,
         name_manual: false,
         icon_manual: false,
+        icon_source: "icons/url.ico".into(),
         generation: 0,
         pending: false,
         sender: send,
@@ -271,6 +273,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 if let Ok(mut state) = cell.try_borrow_mut() {
                     state.icon = Some(icon);
                     state.icon_manual = true;
+                    state.icon_source = path.to_string_lossy().into_owned();
                 }
                 InvalidateRect(GetDlgItem(hwnd, ICON), ptr::null(), 1);
             }
@@ -320,17 +323,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 name.trim().into()
             };
             let icon = state.icon.clone();
-            let custom_icon = state.icon_manual
-                || match (&icon, &state.fallback) {
-                    (Some(icon), Some(fallback)) => icon.pixels() != fallback.pixels(),
-                    (Some(_), None) => true,
-                    _ => false,
-                };
             state.result = Some(Draft {
                 url,
                 name,
                 icon,
-                custom_icon,
+                icon_source: state.icon_source.clone(),
             });
             drop(state);
             EndDialog(hwnd, IDOK as isize);

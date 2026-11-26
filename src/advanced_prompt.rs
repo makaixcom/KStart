@@ -343,7 +343,7 @@ unsafe fn populate(hwnd: HWND, prompt: &Prompt) {
             (240, 208)
         }
     };
-    let confirm = create_ctrl(
+    create_ctrl(
         hwnd,
         font,
         "BUTTON",
@@ -356,7 +356,7 @@ unsafe fn populate(hwnd: HWND, prompt: &Prompt) {
         24,
         IDOK,
     );
-    let cancel = create_ctrl(
+    create_ctrl(
         hwnd,
         font,
         "BUTTON",
@@ -369,14 +369,7 @@ unsafe fn populate(hwnd: HWND, prompt: &Prompt) {
         24,
         IDCANCEL,
     );
-    if visual_footer(prompt).is_some() {
-        advanced_style::button(confirm, false, true);
-        advanced_style::button(cancel, false, false);
-        if matches!(prompt, Prompt::Spacing { .. }) {
-            advanced_style::button(GetDlgItem(hwnd, ID_BEFORE), false, false);
-            advanced_style::button(GetDlgItem(hwnd, ID_DEFAULT), false, false);
-        }
-    }
+
 }
 
 fn visual_footer(prompt: &Prompt) -> Option<i32> {

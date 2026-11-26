@@ -33,7 +33,21 @@ unsafe fn client(hwnd: HWND) -> RECT {
     GetClientRect(hwnd, &mut r);
     r
 }
-unsafe fn move_control(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
+unsafe fn move_control(hwnd: HWND, mut x: i32, mut y: i32, mut w: i32, mut h: i32) {
+    let mut class = [0u16; 32];
+    let len = GetClassNameW(hwnd, class.as_mut_ptr(), 32);
+    if GetDlgCtrlID(hwnd) != GRIP
+        && String::from_utf16_lossy(&class[..len.max(0) as usize]).eq_ignore_ascii_case("SCROLLBAR")
+    {
+        let thin = crate::dialog_scrollbars::WIDTH;
+        if GetWindowLongW(hwnd, GWL_STYLE) as u32 & SBS_VERT as u32 != 0 {
+            x += (w - thin) / 2;
+            w = thin;
+        } else {
+            y += (h - thin) / 2;
+            h = thin;
+        }
+    }
     SetWindowPos(
         hwnd,
         0,
@@ -46,7 +60,8 @@ unsafe fn move_control(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
 }
 unsafe extern "system" fn collect(hwnd: HWND, param: LPARAM) -> i32 {
     let (parent, children) = &mut *(param as *mut (HWND, Vec<Child>));
-    if GetParent(hwnd) == *parent {
+    if GetParent(hwnd) == *parent
+        && GetPropW(hwnd, crate::to_wide(crate::dialog_scrollbars::SOURCE).as_ptr()) == 0 {
         let mut rect = mem::zeroed();
         GetWindowRect(hwnd, &mut rect);
         MapWindowPoints(0, *parent, &mut rect as *mut RECT as *mut POINT, 2);

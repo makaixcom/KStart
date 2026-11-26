@@ -8,7 +8,6 @@ use crate::{
 };
 use std::{
     fs,
-    hash::{DefaultHasher, Hash, Hasher},
     io,
     path::{Path, PathBuf},
     ptr,
@@ -185,15 +184,6 @@ pub unsafe fn command(hwnd: HWND, id: i32, notification: u32) -> bool {
                         }
                         Err(error) => message(hwnd, &format!("恢复失败：{error}")),
                     }
-                }
-            }
-        }
-        dialog::ID_CLEAR_CACHE => {
-            if confirm(hwnd, "清除缓存并恢复默认图标？自选图标保留。") {
-                if let Err(err) = clear_icon_cache(&base) {
-                    message(hwnd, &format!("清空缓存失败：{err}"));
-                } else {
-                    InvalidateRect(owner, ptr::null(), 0);
                 }
             }
         }
@@ -396,21 +386,13 @@ fn copy_backup_files(
         verification,
     )?;
     fs::copy(source.join("data.json"), target.join("data.json"))?;
-    let icons = source.join("icons");
-    if let Ok(entries) = fs::read_dir(icons) {
-        let dest = target.join("icons");
-        fs::create_dir_all(&dest)?;
-        for entry in entries {
-            let entry = entry?;
-            if entry.file_type()?.is_file()
-                && entry
-                    .path()
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("png"))
-            {
-                fs::copy(entry.path(), dest.join(entry.file_name()))?;
-            }
-        }
+    // 计划任务独立存储，旧备份没有计划文件时恢复为空计划。
+    let source_plan = source.join("plan.json");
+    if source_plan.is_file() {
+        let plan: crate::schedule::Plan = serde_json::from_slice(&fs::read(&source_plan)?)?;
+        fs::write(target.join("plan.json"), serde_json::to_vec_pretty(&plan)?)?;
+    } else if target.join("plan.json").is_file() {
+        fs::remove_file(target.join("plan.json"))?;
     }
     Ok(())
 }
@@ -487,6 +469,7 @@ fn restore(owner: HWND, base: &Path, source: &Path) -> io::Result<()> {
     }
     let config = crate::config::UserConfig::load(base);
     let hotkey = crate::config::HotkeyConfig::load(base);
+    let plan = crate::schedule::load(base)?;
     if owner != 0 { crate::hotkeys::changed(owner); }
     let region = APP_STATE.with(|cell| {
         let mut guard = cell.try_borrow_mut().ok()?;
@@ -497,8 +480,13 @@ fn restore(owner: HWND, base: &Path, source: &Path) -> io::Result<()> {
         let skin = config.resolve_active_skin_index(&app.skins);
         app.user_cfg = config;
         app.hotkey_cfg = hotkey;
+        for category in &data.categories {
+            app.builtin_icons.load_category_source(base, &category.icon);
+        }
         app.categories = data.build_runtime_tree(base, &app.builtin_icons.app_icons, &Default::default());
         app.data_store = data;
+        app.plan = plan;
+        app.scheduler.reset_pending();
         app.active_category = 0;
         app.selected_shortcuts.clear();
         app.reload_advanced_assets();
@@ -511,25 +499,6 @@ fn restore(owner: HWND, base: &Path, source: &Path) -> io::Result<()> {
         crate::advanced_window::apply_opacity(owner);
         InvalidateRect(owner, ptr::null(), 0);
     }}
-    Ok(())
-}
-
-fn clear_icon_cache(base: &Path) -> io::Result<()> {
-    let cache = base.join("user/icon-cache");
-    if cache.exists() {
-        let entries = fs::read_dir(cache)?;
-        for entry in entries {
-            let entry = entry?;
-            if entry.file_type()?.is_file()
-                && entry
-                    .path()
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("png"))
-            {
-                fs::remove_file(entry.path())?;
-            }
-        }
-    }
     Ok(())
 }
 
@@ -571,12 +540,29 @@ mod drop_icon_tests {
     }
 
     #[test]
+    fn reading_drop_icon_does_not_create_user_directories() {
+        let base = std::env::temp_dir().join(format!("kstart-direct-icon-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        let file = std::env::current_exe().unwrap();
+        let dropped = prepare_drop(&base, &AdvancedSettings::default(), &file);
+        assert!(dropped.icon.is_some());
+        assert_eq!(dropped.icon_source, file.to_string_lossy());
+        assert!(!base.join("user").exists());
+        let mut store = crate::model::AppDataStore::default_store();
+        store.shortcuts[0].icon_key = dropped.icon_source;
+        let tree = store.build_runtime_tree(&base, &Default::default(), &Default::default());
+        assert!(tree.iter().flat_map(|cat| &cat.groups).flat_map(|group| &group.items)
+            .find(|item| item.id == store.shortcuts[0].id).unwrap().custom_icon_16.is_some());
+        assert!(!base.join("user").exists());
+        fs::remove_dir(&base).unwrap();
+    }
+
+    #[test]
     fn relative_launch_path_keeps_the_original_icon_source() {
         let file = std::env::current_exe().unwrap();
         let base = file.parent().unwrap();
         let mut settings = AdvancedSettings::default();
         settings.set(Key::RelativePaths, "1".into());
-        settings.set(Key::SkipIconCache, "1".into());
         settings.set(Key::SkipExeIcons, "1".into());
         let dropped = prepare_drop(base, &settings, &file);
         assert_eq!(dropped.icon_source, file.to_string_lossy());
@@ -585,7 +571,7 @@ mod drop_icon_tests {
     }
 }
 
-fn default_drop_icon_source(file: &Path, link_target: Option<&str>) -> PathBuf {
+pub(crate) fn default_drop_icon_source(file: &Path, link_target: Option<&str>) -> PathBuf {
     match link_target.filter(|target| !target.is_empty()) {
         Some(target) if Path::new(target).is_absolute() => PathBuf::from(target),
         Some(target) => file.parent().unwrap_or_else(|| Path::new(".")).join(target),
@@ -614,7 +600,7 @@ pub fn prepare_drop(base: &Path, settings: &AdvancedSettings, file: &Path) -> Dr
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    // 默认图标始终取链接目标；是否把启动路径展开为目标由设置另行决定。
+    // 快捷方式读取目标程序的图标，启动路径是否展开由设置单独决定。
     let file_link = extension.eq_ignore_ascii_case("lnk")
         .then(|| crate::advanced_shell::file_link(file)).flatten();
     let icon_path = default_drop_icon_source(file, file_link.as_ref().map(|link| link.0.as_str()));
@@ -631,7 +617,7 @@ pub fn prepare_drop(base: &Path, settings: &AdvancedSettings, file: &Path) -> Dr
     let icon = if settings.enabled(Key::WebIcons) && crate::advanced_web_icon::is_web_url(&target) {
         None
     } else {
-        cached_file_icon(base, settings, &icon_path)
+        read_file_icon(settings, &icon_path)
     };
     let icon_source = icon_path.to_string_lossy().into_owned();
     if settings.enabled(Key::RelativePaths) && resolved_path.is_absolute() {
@@ -650,8 +636,7 @@ pub fn prepare_drop(base: &Path, settings: &AdvancedSettings, file: &Path) -> Dr
     }
 }
 
-fn cached_file_icon(
-    base: &Path,
+fn read_file_icon(
     settings: &AdvancedSettings,
     file: &Path,
 ) -> Option<crate::skin_assets::RgbaSurface> {
@@ -662,50 +647,33 @@ fn cached_file_icon(
     {
         return None;
     }
-    if settings.enabled(Key::SkipIconCache) {
-        return crate::skin_assets::extract_file_icon_32(file);
-    }
-    let mut hasher = DefaultHasher::new();
-    file.hash(&mut hasher);
-    fs::metadata(file)
-        .ok()
-        .and_then(|meta| meta.modified().ok())
-        .hash(&mut hasher);
-    let directory = base.join("user/icon-cache");
-    let cache = directory.join(format!("{:016x}-32.png", hasher.finish()));
-    if let Some(image) = crate::skin_assets::RgbaSurface::load_file(&cache) {
-        return Some(image);
-    }
-    let image = crate::skin_assets::extract_file_icon_32(file)?;
-    if fs::create_dir_all(directory).is_ok() {
-        let _ = image.save_png(&cache);
-    }
-    Some(image)
+    crate::skin_assets::extract_file_icon_32(file)
 }
 
 #[cfg(test)]
 mod audit_tests {
     use super::*;
     #[test]
-    fn backup_restore_preserves_credentials_and_cache_clear_preserves_user_icons() {
+    fn backup_restore_preserves_credentials() {
         let base=std::env::temp_dir().join(format!("kstart-backup-audit-{}",std::process::id()));
         let mut config=crate::config::UserConfig::default();
         config.advanced.set(Key::DefaultColor,"#123456".into());
         let credentials=crate::config::Verification{login:"original-login".into(),lock:"original-lock".into()};
         config.save_to(&base.join("user"),&Default::default(),&credentials).unwrap();
         let data=crate::model::AppDataStore::default_store();data.save(&base);
-        fs::create_dir_all(base.join("user/icons")).unwrap();fs::create_dir_all(base.join("user/icon-cache")).unwrap();
-        fs::write(base.join("user/icons/chosen.png"),b"chosen").unwrap();fs::write(base.join("user/icon-cache/derived.png"),b"cache").unwrap();
+        let mut task=crate::schedule::Task::new(crate::local_clock::now(),"backup-test");task.name="备份计划".into();task.reminder="备份回归".into();
+        crate::schedule::save(&base,&crate::schedule::Plan{tasks:vec![task]}).unwrap();
         let export=base.join("export");backup(&base,&export).unwrap();
+        let saved_plan:crate::schedule::Plan=serde_json::from_slice(&fs::read(export.join("plan.json")).unwrap()).unwrap();assert_eq!(saved_plan.tasks[0].name,"备份计划");
+        crate::schedule::save(&base,&Default::default()).unwrap();
         assert!(crate::config::Verification::load(&export).login.is_empty());
         config.advanced.set(Key::DefaultColor,"#FFFFFF".into());
         let current=crate::config::Verification{login:"current-login".into(),lock:"current-lock".into()};
         config.save_to(&base.join("user"),&Default::default(),&current).unwrap();
         restore(0,&base,&export).unwrap();
+        assert_eq!(crate::schedule::load(&base).unwrap().tasks[0].name,"备份计划");
         assert_eq!(crate::config::UserConfig::load(&base).advanced.text(Key::DefaultColor),"#123456");
         assert_eq!(crate::config::Verification::load(&base.join("user")).login,"current-login");
-        clear_icon_cache(&base).unwrap();
-        assert!(!base.join("user/icon-cache/derived.png").exists());assert!(base.join("user/icons/chosen.png").exists());
         fs::remove_dir_all(base).unwrap();
     }
 }

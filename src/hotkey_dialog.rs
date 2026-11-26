@@ -1,7 +1,6 @@
 //! 热键管理、单条编辑、系统功能选择和文本输出窗口。
 
 use crate::{
-    advanced_style,
     config::HotkeyConfig,
     hotkeys::{self, Action, Binding, Key},
     native_dialogs::{blit_surface_on_bg, create_ctrl, get_ctrl_text, set_ctrl_text},
@@ -222,7 +221,6 @@ unsafe fn button(hwnd: HWND, id: i32, label: &str, x: i32, y: i32, width: i32) -
         24,
         id,
     );
-    advanced_style::button(control, false, id == IDOK);
     control
 }
 

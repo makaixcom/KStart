@@ -89,19 +89,6 @@ impl RgbaSurface {
         Some(Self::from_pixels(width, height, pixels))
     }
 
-    /// 将当前 RGBA 表面保存为 PNG 文件
-    pub fn save_png(&self, path: &Path) -> bool {
-        image::save_buffer_with_format(
-            path,
-            self.pixels().as_flattened(),
-            self.width,
-            self.height,
-            image::ColorType::Rgba8,
-            image::ImageFormat::Png,
-        )
-        .is_ok()
-    }
-
     /// 常用图标尺寸只缩放一次，所有副本共用结果；其他尺寸按需计算。
     pub fn resize_to(&self, target_w: u32, target_h: u32) -> Self {
         if self.width == target_w && self.height == target_h {
